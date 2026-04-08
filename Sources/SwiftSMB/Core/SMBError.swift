@@ -1,0 +1,91 @@
+//
+//  SMBError.swift
+//  SwiftSMB
+//
+//  Created by Preet Singh on 4/7/26.
+//
+// Every error SwiftSMB can throw, in one place.
+// New cases will be added in future steps as we build each layer.
+
+import Foundation
+
+public enum SMBError: LocalizedError {
+
+    // ── Step 1: Foundation ───────────────────────────────────────────────
+    case truncatedPacket               // tried to read past end of buffer
+    case invalidProtocolId             // magic bytes didn't match SMB2
+
+    // ── Step 2: Crypto (placeholders, implemented in v0.2.0) ────────────
+    case authenticationFailed
+    case invalidNTLMMessage
+    case spnegoDecodeFailed
+
+    // ── Step 4: Transport (placeholders, implemented in v0.4.0) ─────────
+    case connectionFailed(String)
+    case connectionLost
+    case notConnected
+    case timeout
+
+    // ── Step 5: Session (placeholders, implemented in v0.5.0) ───────────
+    case ntStatus(UInt32)              // raw NT status code from server
+    case negotiationFailed(String)
+    case unexpectedCommand(expected: UInt16, got: UInt16)
+
+    // ── Step 6: Client (placeholders, implemented in v0.6.0) ────────────
+    case fileNotFound(String)
+    case accessDenied(String)
+    case invalidPath
+
+    public var errorDescription: String? {
+        switch self {
+        case .truncatedPacket:
+            return "Tried to read past the end of an SMB2 packet."
+        case .invalidProtocolId:
+            return "Packet does not start with the SMB2 magic bytes (0xFE 'S' 'M' 'B')."
+        case .authenticationFailed:
+            return "SMB authentication failed — check your username and password."
+        case .invalidNTLMMessage:
+            return "Received an invalid NTLM message from the server."
+        case .spnegoDecodeFailed:
+            return "Failed to decode the SPNEGO/GSSAPI token from the server."
+        case .connectionFailed(let detail):
+            return "SMB connection failed: \(detail)"
+        case .connectionLost:
+            return "The SMB connection was lost unexpectedly."
+        case .notConnected:
+            return "Not connected to any SMB share. Call connectShare() first."
+        case .timeout:
+            return "The SMB operation timed out."
+        case .ntStatus(let code):
+            return "Server returned NT status 0x\(String(code, radix: 16, uppercase: true)): \(ntStatusDescription(code))"
+        case .negotiationFailed(let detail):
+            return "SMB dialect negotiation failed: \(detail)"
+        case .unexpectedCommand(let expected, let got):
+            return "Expected SMB2 command 0x\(String(expected, radix: 16)), got 0x\(String(got, radix: 16))."
+        case .fileNotFound(let path):
+            return "File not found on the SMB share: \(path)"
+        case .accessDenied(let path):
+            return "Access denied: \(path)"
+        case .invalidPath:
+            return "The provided path is invalid."
+        }
+    }
+}
+
+// MARK: - NT Status → human-readable description
+
+private func ntStatusDescription(_ code: UInt32) -> String {
+    switch code {
+    case 0x00000000: return "SUCCESS"
+    case 0xC0000016: return "MORE_PROCESSING_REQUIRED"
+    case 0xC0000022: return "ACCESS_DENIED"
+    case 0xC0000034: return "OBJECT_NAME_NOT_FOUND"
+    case 0xC000003A: return "OBJECT_PATH_NOT_FOUND"
+    case 0xC000006D: return "LOGON_FAILURE — wrong username or password"
+    case 0xC000006E: return "ACCOUNT_RESTRICTION"
+    case 0x80000006: return "NO_MORE_FILES"
+    case 0xC0000011: return "END_OF_FILE"
+    case 0xC0000043: return "SHARING_VIOLATION"
+    default:         return "unknown status"
+    }
+}
