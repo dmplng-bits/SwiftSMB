@@ -257,6 +257,30 @@ public enum SMB2FileInformationClass {
     public static let fileStreamInformation:     UInt8 = 0x16
 }
 
+// MARK: - Oplock Levels ([MS-SMB2] §2.2.13)
+
+public enum SMB2OplockLevel {
+    public static let none:      UInt8 = 0x00
+    public static let levelII:   UInt8 = 0x01  // shared read cache
+    public static let exclusive: UInt8 = 0x08  // exclusive cache
+    public static let batch:     UInt8 = 0x09  // batch (read+write+handle)
+    public static let lease:     UInt8 = 0xFF  // use lease instead
+}
+
+// MARK: - Lease State ([MS-SMB2] §2.2.13.2.8)
+
+public enum SMB2LeaseState {
+    public static let none:          UInt32 = 0x00
+    public static let readCaching:   UInt32 = 0x01  // R — cache reads locally
+    public static let handleCaching: UInt32 = 0x02  // H — cache handle opens
+    public static let writeCaching:  UInt32 = 0x04  // W — cache writes locally
+
+    /// RH lease — good for media browsing (cache reads + handle across navigations)
+    public static let readHandle:    UInt32 = 0x03
+    /// RWH lease — full cache, only granted if no other clients have the file open
+    public static let readWriteHandle: UInt32 = 0x07
+}
+
 // MARK: - NT Status codes (commonly seen)
 
 public enum NTStatus {
@@ -273,7 +297,9 @@ public enum NTStatus {
     public static let logonFailure:           UInt32 = 0xC000_006D
     public static let accountRestriction:     UInt32 = 0xC000_006E
     public static let passwordExpired:        UInt32 = 0xC000_0071
+    public static let directoryNotEmpty:      UInt32 = 0xC000_0101
     public static let insufficientResources:  UInt32 = 0xC000_009A
+    public static let cancelled:              UInt32 = 0xC000_0120
     public static let notFound:               UInt32 = 0xC000_0225
     public static let noMoreFiles:            UInt32 = 0x8000_0006
     public static let bufferOverflow:         UInt32 = 0x8000_0005

@@ -35,6 +35,22 @@ public enum SMBError: LocalizedError {
     case fileNotFound(String)
     case accessDenied(String)
     case invalidPath
+    case directoryNotEmpty(String)
+    case fileAlreadyExists(String)
+
+    // ── Credit management ──────────────────────────────────────────────
+    case insufficientCredits(needed: UInt16, available: UInt16)
+
+    // ── Signing ────────────────────────────────────────────────────────
+    case signingRequired                // server requires signing but we can't
+    case signatureVerificationFailed    // inbound packet signature mismatch
+
+    // ── Discovery ──────────────────────────────────────────────────────
+    case discoveryFailed(String)
+    case shareEnumerationFailed(String)
+
+    // ── Reconnect ──────────────────────────────────────────────────────
+    case reconnectFailed(String)
 
     public var errorDescription: String? {
         switch self {
@@ -68,6 +84,22 @@ public enum SMBError: LocalizedError {
             return "Access denied: \(path)"
         case .invalidPath:
             return "The provided path is invalid."
+        case .directoryNotEmpty(let path):
+            return "Directory is not empty: \(path)"
+        case .fileAlreadyExists(let path):
+            return "File already exists: \(path)"
+        case .insufficientCredits(let needed, let available):
+            return "Not enough SMB2 credits: need \(needed), have \(available). Try a smaller read."
+        case .signingRequired:
+            return "The server requires message signing, but signing is not available."
+        case .signatureVerificationFailed:
+            return "The SMB2 response signature did not match. The packet may be corrupted."
+        case .discoveryFailed(let detail):
+            return "SMB server discovery failed: \(detail)"
+        case .shareEnumerationFailed(let detail):
+            return "Failed to enumerate shares: \(detail)"
+        case .reconnectFailed(let detail):
+            return "SMB reconnect failed: \(detail)"
         }
     }
 }
@@ -81,8 +113,10 @@ private func ntStatusDescription(_ code: UInt32) -> String {
     case 0xC0000022: return "ACCESS_DENIED"
     case 0xC0000034: return "OBJECT_NAME_NOT_FOUND"
     case 0xC000003A: return "OBJECT_PATH_NOT_FOUND"
+    case 0xC0000035: return "OBJECT_NAME_COLLISION — file already exists"
     case 0xC000006D: return "LOGON_FAILURE — wrong username or password"
     case 0xC000006E: return "ACCOUNT_RESTRICTION"
+    case 0xC0000101: return "DIRECTORY_NOT_EMPTY"
     case 0x80000006: return "NO_MORE_FILES"
     case 0xC0000011: return "END_OF_FILE"
     case 0xC0000043: return "SHARING_VIOLATION"

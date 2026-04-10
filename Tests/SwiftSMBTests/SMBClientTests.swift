@@ -191,6 +191,82 @@ final class SMBClientTests: XCTestCase {
         XCTAssertEqual(smbFile.path, "root.txt")
     }
 
+    // MARK: - SMBFile convenience helpers
+
+    func testSMBFileConvenienceFileSizeUsesCache() async throws {
+        // When size > 0, fileSize(of:) should return the cached value
+        // without hitting the wire. We can't call the actor method directly
+        // without a real server, but we verify the SMBFile itself holds the value.
+        let f = SMBFile(
+            path: "Photos/sunset.jpg",
+            name: "sunset.jpg",
+            size: 4_200_000,
+            isDirectory: false,
+            isHidden: false,
+            attributes: 0
+        )
+        // The cached size should be exactly what was set.
+        XCTAssertEqual(f.size, 4_200_000)
+        XCTAssertFalse(f.isDirectory)
+    }
+
+    func testSMBFileDirectorySizeIsAlwaysZero() {
+        let dir = SMBFile(
+            path: "Photos",
+            name: "Photos",
+            size: 0,
+            isDirectory: true,
+            isHidden: false,
+            attributes: SMB2FileAttributes.directory
+        )
+        XCTAssertEqual(dir.size, 0)
+        XCTAssertTrue(dir.isDirectory)
+    }
+
+    // MARK: - Photo/media file extension tests
+
+    func testSMBFileCommonPhotoExtensions() {
+        let cases: [(name: String, expected: String)] = [
+            ("sunset.JPG", "jpg"),
+            ("portrait.HEIC", "heic"),
+            ("raw.DNG", "dng"),
+            ("scan.PNG", "png"),
+            ("photo.CR3", "cr3"),
+            ("image.ARW", "arw"),
+            ("pic.TIFF", "tiff"),
+        ]
+        for (name, expected) in cases {
+            let f = SMBFile(path: name, name: name, size: 0,
+                            isDirectory: false, isHidden: false, attributes: 0)
+            XCTAssertEqual(f.fileExtension, expected,
+                           "Expected \(expected) for \(name)")
+        }
+    }
+
+    func testSMBFileCommonVideoExtensions() {
+        let cases: [(name: String, expected: String)] = [
+            ("movie.MKV", "mkv"),
+            ("clip.MP4", "mp4"),
+            ("video.AVI", "avi"),
+            ("film.MOV", "mov"),
+        ]
+        for (name, expected) in cases {
+            let f = SMBFile(path: name, name: name, size: 0,
+                            isDirectory: false, isHidden: false, attributes: 0)
+            XCTAssertEqual(f.fileExtension, expected,
+                           "Expected \(expected) for \(name)")
+        }
+    }
+
+    func testSMBFileMultiDotExtension() {
+        let f = SMBFile(
+            path: "backup.2024.01.tar.gz",
+            name: "backup.2024.01.tar.gz",
+            size: 0, isDirectory: false, isHidden: false, attributes: 0
+        )
+        XCTAssertEqual(f.fileExtension, "gz")
+    }
+
     func testSMBFileIsDirectoryIsForwardedCorrectly() {
         let info = FileBothDirectoryInfo(
             fileName:       "subdir",

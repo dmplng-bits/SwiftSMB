@@ -113,6 +113,64 @@ public enum SMB2CreateRequest {
             createOptions: SMB2CreateOptions.nonDirectoryFile
         )
     }
+
+    /// Build a CREATE request with a create context (e.g. lease request).
+    public static func buildWithContext(
+        path: String,
+        desiredAccess: UInt32 = SMB2AccessMask.genericRead | SMB2AccessMask.fileReadAttributes,
+        fileAttributes: UInt32 = 0,
+        shareAccess: UInt32 = SMB2ShareAccess.read,
+        createDisposition: UInt32 = SMB2CreateDisposition.open,
+        createOptions: UInt32 = 0,
+        oplockLevel: UInt8 = SMB2OplockLevel.none,
+        createContext: Data
+    ) -> Data {
+        let pathData = path.utf16leData
+        let nameOffset: UInt16 = UInt16(smb2HeaderSize) + 56
+
+        // Create contexts start after the path data, padded to 8-byte alignment
+        let pathEnd = Int(nameOffset) - smb2HeaderSize + pathData.count
+        let contextPadding = (8 - (pathEnd % 8)) % 8
+        let contextOffset = UInt32(smb2HeaderSize) + UInt32(pathEnd) + UInt32(contextPadding)
+
+        var w = ByteWriter()
+        w.uint16le(structureSize)               // StructureSize (57)
+        w.uint8(0)                              // SecurityFlags
+        w.uint8(oplockLevel)                    // RequestedOplockLevel
+        w.uint32le(0x0000_0002)                 // ImpersonationLevel
+        w.zeros(8)                              // SmbCreateFlags
+        w.zeros(8)                              // Reserved
+        w.uint32le(desiredAccess)               // DesiredAccess
+        w.uint32le(fileAttributes)              // FileAttributes
+        w.uint32le(shareAccess)                 // ShareAccess
+        w.uint32le(createDisposition)           // CreateDisposition
+        w.uint32le(createOptions)               // CreateOptions
+        w.uint16le(nameOffset)                  // NameOffset
+        w.uint16le(UInt16(pathData.count))      // NameLength
+        w.uint32le(contextOffset)               // CreateContextsOffset
+        w.uint32le(UInt32(createContext.count))  // CreateContextsLength
+        w.bytes(pathData)                       // Buffer (path)
+        w.zeros(contextPadding)                 // Padding to 8-byte alignment
+        w.bytes(createContext)                   // Create contexts
+        return w.data
+    }
+
+    /// Convenience: open a file for reading with an RH lease for caching.
+    public static func openFileWithLease(path: String, leaseKey: Data) -> Data {
+        let contextData = SMB2LeaseContext.buildV1(
+            leaseKey: leaseKey,
+            leaseState: SMB2LeaseState.readHandle
+        )
+        return buildWithContext(
+            path: path,
+            desiredAccess: SMB2AccessMask.genericRead,
+            shareAccess: SMB2ShareAccess.read,
+            createDisposition: SMB2CreateDisposition.open,
+            createOptions: SMB2CreateOptions.nonDirectoryFile,
+            oplockLevel: SMB2OplockLevel.lease,
+            createContext: contextData
+        )
+    }
 }
 
 // MARK: - CREATE Response Parser
