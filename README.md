@@ -18,6 +18,54 @@ dependencies: [
 ]
 ```
 
+## Quick Start
+
+```swift
+import SwiftSMB
+import AVKit
+
+let client = SMBClient(host: "192.168.1.100")
+
+// Connect and authenticate
+try await client.connectShare(
+    "Videos",
+    credentials: SMBCredentials(user: "me", password: "secret")
+)
+
+// Browse
+let movies = try await client.listDirectory("Movies")
+for movie in movies where !movie.isDirectory {
+    print("\(movie.name) — \(movie.size) bytes")
+}
+
+// Stream with AVPlayer
+let url = try await client.url(ofItem: "Movies/Inception.mkv")
+let player = AVPlayer(url: url)
+player.play()
+
+// Or read bytes directly
+let header = try await client.contents(
+    atPath: "Movies/Inception.mkv",
+    range: 0..<4096
+)
+
+await client.disconnect()
+```
+
+## Public API
+
+The top-level facade is `SMBClient`. It's an actor, so it's safe to share across concurrent callers.
+
+- `SMBClient(host:port:)` — create a client bound to a server.
+- `connectShare(_:credentials:)` — connect TCP, run NEGOTIATE → NTLMv2 → TREE_CONNECT.
+- `listDirectory(_:)` — enumerate a directory and return `[SMBFile]`.
+- `fileSize(at:)` — return a file's size in bytes without reading any data.
+- `contents(atPath:range:)` — read a byte range from a file.
+- `url(ofItem:)` — mint an `http://127.0.0.1:…` streaming URL for AVPlayer.
+- `disconnect()` — tear down the tree, session, and socket.
+
+`SMBFile` carries the file name, path, size, attributes, and Windows FILETIME timestamps converted to `Date`.
+
 ---
 
 ## Layer Architecture
@@ -26,28 +74,29 @@ The library is organized into seven layers, each building on the one below it.
 
 ```mermaid
 flowchart TD
-    Client["<b>Client Layer</b>\nSMBClient public API\nconnect · list · read · stream"]
-    Streaming["<b>Streaming Layer</b>\nLocal HTTP/1.1 Proxy\nAVPlayer ↔ Range requests ↔ SMB2 READ"]
-    Session["<b>Session Layer</b>\nNEGOTIATE → NTLMv2 Auth → TREE_CONNECT"]
+    Streaming["<b>Streaming Layer</b>\nSMBStreamingProxy\nLocal HTTP/1.1 on 127.0.0.1\nAVPlayer ↔ Range requests ↔ SMB2 READ"]
+    Client["<b>Client Layer</b>\nSMBClient · SMBFile public API\nconnectShare · listDirectory · contents · url(ofItem:)"]
+    Session["<b>Session Layer</b>\nSMBSession\nNEGOTIATE → NTLMv2 Auth → TREE_CONNECT\nmessageId / sessionId / treeId bookkeeping"]
+    Transport["<b>Transport Layer</b>\nSMBTransport\nNetwork.framework NWConnection\nNetBIOS 4-byte length framing"]
     Protocol["<b>Protocol Layer</b>\nSMB2 Header · Packet Builders · Response Parsers\nCREATE · READ · CLOSE · QUERY_DIRECTORY · QUERY_INFO"]
     Crypto["<b>Crypto Layer</b>\nMD4 (pure Swift) · NTLMv2 · HMAC-MD5 (CryptoKit)\nASN.1 DER Codec · SPNEGO"]
-    Transport["<b>Transport Layer</b>\nNetwork.framework TCP · NetBIOS 4-byte framing"]
     Core["<b>Core</b>\nByteWriter · ByteReader (little-endian I/O)\nSMBError (unified error enum)"]
 
-    Client --> Streaming
-    Streaming --> Session
+    Streaming --> Client
+    Client --> Session
+    Session --> Transport
     Session --> Protocol
     Protocol --> Crypto
-    Protocol --> Transport
+    Protocol --> Core
     Transport --> Core
     Crypto --> Core
 
-    style Client fill:#4A90D9,color:#fff
     style Streaming fill:#7B68EE,color:#fff
+    style Client fill:#4A90D9,color:#fff
     style Session fill:#E67E22,color:#fff
+    style Transport fill:#F39C12,color:#fff
     style Protocol fill:#27AE60,color:#fff
     style Crypto fill:#E74C3C,color:#fff
-    style Transport fill:#F39C12,color:#fff
     style Core fill:#2C3E50,color:#fff
 ```
 
@@ -67,7 +116,7 @@ flowchart LR
     subgraph Crypto
         MD4["MD4"]
         NTLMv2["NTLMv2"]
-        ASN1["ASN1\nEncoder · Decoder"]
+        ASN1["ASN1"]
         SPNEGO["SPNEGO"]
     end
 
@@ -75,12 +124,29 @@ flowchart LR
         Constants["SMB2Constants"]
         Header["SMB2Header"]
         Negotiate["SMB2Negotiate"]
-        Session["SMB2Session"]
+        SessionMsg["SMB2Session"]
         Tree["SMB2Tree"]
         Create["SMB2Create"]
         Close["SMB2Close"]
         Read["SMB2Read"]
         Query["SMB2Query"]
+    end
+
+    subgraph Transport
+        SMBTransport["SMBTransport"]
+    end
+
+    subgraph Session
+        SMBSession["SMBSession"]
+    end
+
+    subgraph Client
+        SMBClient["SMBClient"]
+        SMBFile["SMBFile"]
+    end
+
+    subgraph Streaming
+        SMBStreamingProxy["SMBStreamingProxy"]
     end
 
     MD4 --> ByteBuffer
@@ -95,8 +161,8 @@ flowchart LR
     Header --> SMBError
     Negotiate --> ByteBuffer
     Negotiate --> Constants
-    Session --> ByteBuffer
-    Session --> Constants
+    SessionMsg --> ByteBuffer
+    SessionMsg --> Constants
     Tree --> ByteBuffer
     Tree --> Constants
     Create --> ByteBuffer
@@ -106,9 +172,32 @@ flowchart LR
     Query --> ByteBuffer
     Query --> Constants
 
+    SMBTransport --> SMBError
+    SMBSession --> SMBTransport
+    SMBSession --> Header
+    SMBSession --> Negotiate
+    SMBSession --> SessionMsg
+    SMBSession --> Tree
+    SMBSession --> NTLMv2
+    SMBSession --> SPNEGO
+
+    SMBClient --> SMBSession
+    SMBClient --> Create
+    SMBClient --> Close
+    SMBClient --> Read
+    SMBClient --> Query
+    SMBClient --> SMBFile
+    SMBFile --> Query
+
+    SMBStreamingProxy --> SMBClient
+
     style Core fill:#2C3E50,color:#fff
     style Crypto fill:#E74C3C,color:#fff
     style Protocol fill:#27AE60,color:#fff
+    style Transport fill:#F39C12,color:#fff
+    style Session fill:#E67E22,color:#fff
+    style Client fill:#4A90D9,color:#fff
+    style Streaming fill:#7B68EE,color:#fff
 ```
 
 ---
@@ -324,23 +413,32 @@ flowchart TD
 ```
 Sources/SwiftSMB/
 ├── Core/
-│   ├── ByteBuffer.swift      # Little-endian binary I/O
-│   └── SMBError.swift         # Unified error enum for all layers
+│   ├── ByteBuffer.swift         # Little-endian binary I/O
+│   └── SMBError.swift            # Unified error enum for all layers
 ├── Crypto/
-│   ├── MD4.swift              # Pure Swift MD4 (RFC 1320)
-│   ├── NTLMv2.swift           # NTLMv2 auth + HMAC-MD5 via CryptoKit
-│   ├── ASN1.swift             # ASN.1 DER encoder/decoder
-│   └── SPNEGO.swift           # SPNEGO token wrapping/parsing
-└── Protocol/
-    ├── SMB2Constants.swift    # Commands, flags, dialects, capabilities
-    ├── SMB2Header.swift       # 64-byte SMB2 header builder/parser
-    ├── SMB2Negotiate.swift    # NEGOTIATE request/response
-    ├── SMB2Session.swift      # SESSION_SETUP request/response, LOGOFF
-    ├── SMB2Tree.swift         # TREE_CONNECT/DISCONNECT
-    ├── SMB2Create.swift       # CREATE (open file) request/response
-    ├── SMB2Close.swift        # CLOSE request/response
-    ├── SMB2Read.swift         # READ request/response
-    └── SMB2Query.swift        # QUERY_DIRECTORY, QUERY_INFO
+│   ├── MD4.swift                 # Pure Swift MD4 (RFC 1320)
+│   ├── NTLMv2.swift              # NTLMv2 auth + HMAC-MD5 via CryptoKit
+│   ├── ASN1.swift                # ASN.1 DER encoder/decoder
+│   └── SPNEGO.swift              # SPNEGO token wrapping/parsing
+├── Protocol/
+│   ├── SMB2Constants.swift       # Commands, flags, dialects, capabilities
+│   ├── SMB2Header.swift          # 64-byte SMB2 header builder/parser
+│   ├── SMB2Negotiate.swift       # NEGOTIATE request/response
+│   ├── SMB2Session.swift         # SESSION_SETUP, LOGOFF
+│   ├── SMB2Tree.swift            # TREE_CONNECT/DISCONNECT
+│   ├── SMB2Create.swift          # CREATE (open file) request/response
+│   ├── SMB2Close.swift           # CLOSE request/response
+│   ├── SMB2Read.swift            # READ request/response
+│   └── SMB2Query.swift           # QUERY_DIRECTORY, QUERY_INFO
+├── Transport/
+│   └── SMBTransport.swift        # TCP + NetBIOS 4-byte framing
+├── Session/
+│   └── SMBSession.swift          # Handshake + request/response core
+├── Client/
+│   ├── SMBClient.swift           # Public high-level API
+│   └── SMBFile.swift             # File metadata struct
+└── Streaming/
+    └── SMBStreamingProxy.swift   # Local HTTP/1.1 proxy for AVPlayer
 ```
 
 ## Design Decisions
