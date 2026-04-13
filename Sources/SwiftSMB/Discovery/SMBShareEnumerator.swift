@@ -236,8 +236,7 @@ public enum SMBShareEnumerator {
 
         // Fix up frag length.
         let totalLen = UInt16(w.data.count)
-        w.data[w.data.startIndex + fragLenOffset]     = UInt8(totalLen & 0xFF)
-        w.data[w.data.startIndex + fragLenOffset + 1] = UInt8(totalLen >> 8)
+        w.patchUint16le(totalLen, at: fragLenOffset)
 
         return w.data
     }
@@ -292,8 +291,7 @@ public enum SMBShareEnumerator {
 
         // Fix up frag length
         let totalLen = UInt16(w.data.count)
-        w.data[w.data.startIndex + fragLenOffset]     = UInt8(totalLen & 0xFF)
-        w.data[w.data.startIndex + fragLenOffset + 1] = UInt8(totalLen >> 8)
+        w.patchUint16le(totalLen, at: fragLenOffset)
 
         return w.data
     }

@@ -1,3 +1,4 @@
+// swift-tools-version: 5.9
 //
 //  Package.swift
 //  SwiftSMB
@@ -5,7 +6,6 @@
 //  Created by Preet Singh on 4/7/26.
 //
 
-// swift-tools-version: 5.9
 import PackageDescription
 
 let package = Package(

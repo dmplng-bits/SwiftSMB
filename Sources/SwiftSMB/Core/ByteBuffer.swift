@@ -81,6 +81,18 @@ public struct ByteWriter {
 
     // ── String encoding ───────────────────────────────────────────────────
 
+    /// Overwrite a single byte at the given offset from the start of `data`.
+    /// Used to patch fields (e.g. frag_length) after the full packet is built.
+    public mutating func patch(_ value: UInt8, at offset: Int) {
+        data[data.startIndex + offset] = value
+    }
+
+    /// Overwrite a UInt16 (little-endian) starting at the given offset.
+    public mutating func patchUint16le(_ value: UInt16, at offset: Int) {
+        data[data.startIndex + offset]     = UInt8(value & 0xFF)
+        data[data.startIndex + offset + 1] = UInt8(value >> 8)
+    }
+
     /// Append a Swift String encoded as UTF-16 little-endian.
     /// SMB2 uses UTF-16LE for all path and name fields.
     @discardableResult
