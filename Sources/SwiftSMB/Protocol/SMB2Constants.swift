@@ -294,9 +294,15 @@ public enum NTStatus {
     public static let objectNameCollision:    UInt32 = 0xC000_0035
     public static let objectPathNotFound:     UInt32 = 0xC000_003A
     public static let sharingViolation:       UInt32 = 0xC000_0043
+    public static let noSuchUser:             UInt32 = 0xC000_0064
+    public static let wrongPassword:          UInt32 = 0xC000_006A
     public static let logonFailure:           UInt32 = 0xC000_006D
     public static let accountRestriction:     UInt32 = 0xC000_006E
+    public static let accountDisabled:        UInt32 = 0xC000_0072
     public static let passwordExpired:        UInt32 = 0xC000_0071
+    public static let badNetworkName:         UInt32 = 0xC000_00CC
+    public static let notSupported:           UInt32 = 0xC000_00BB
+    public static let userSessionDeleted:     UInt32 = 0xC000_00E7
     public static let directoryNotEmpty:      UInt32 = 0xC000_0101
     public static let insufficientResources:  UInt32 = 0xC000_009A
     public static let cancelled:              UInt32 = 0xC000_0120

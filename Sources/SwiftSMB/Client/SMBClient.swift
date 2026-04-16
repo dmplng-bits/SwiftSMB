@@ -647,9 +647,14 @@ public actor SMBClient {
         case NTStatus.directoryNotEmpty:
             return .directoryNotEmpty(path)
         case NTStatus.logonFailure,
+             NTStatus.wrongPassword,
+             NTStatus.noSuchUser,
              NTStatus.accountRestriction,
+             NTStatus.accountDisabled,
              NTStatus.passwordExpired:
             return .authenticationFailed
+        case NTStatus.badNetworkName:
+            return .fileNotFound(path)
         default:
             return .ntStatus(status)
         }

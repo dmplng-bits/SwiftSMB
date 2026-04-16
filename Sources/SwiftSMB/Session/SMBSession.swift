@@ -25,19 +25,44 @@ import CryptoKit
 // MARK: - Credentials
 
 /// The username/password/domain bundle handed to `SMBSession.authenticate`.
+///
+/// For unauthenticated access, prefer `.anonymous` over passing empty
+/// strings for user/password. Anonymous and guest are *different* auth
+/// modes on the wire — modern Samba, TrueNAS Scale, and Windows Server
+/// reject "guest" by default but still allow anonymous IPC$ connections.
+/// See [MS-NLMP] §3.2.5.1.2 (NTLMSSP_NEGOTIATE_ANONYMOUS).
 public struct SMBCredentials: Sendable {
-    public let user:     String
-    public let password: String
-    public let domain:   String
+    public let user:        String
+    public let password:    String
+    public let domain:      String
+    public let workstation: String
+    public let isAnonymous: Bool
 
-    public init(user: String, password: String, domain: String = "") {
-        self.user     = user
-        self.password = password
-        self.domain   = domain
+    public init(
+        user: String,
+        password: String,
+        domain: String = "",
+        workstation: String = "",
+        isAnonymous: Bool = false
+    ) {
+        self.user        = user
+        self.password    = password
+        self.domain      = domain
+        self.workstation = workstation
+        // Auto-detect anonymous if caller passed empty creds and didn't
+        // opt out. Matches Finder's behavior for bare `smb://host`.
+        self.isAnonymous = isAnonymous || (user.isEmpty && password.isEmpty)
     }
 
-    /// Convenience for anonymous / guest access.
-    public static let guest = SMBCredentials(user: "", password: "", domain: "")
+    /// Explicit anonymous (null-session) access. Emits an empty
+    /// NTLMSSP AUTHENTICATE message with the anonymous flag set.
+    public static let anonymous = SMBCredentials(
+        user: "", password: "", domain: "", workstation: "", isAnonymous: true
+    )
+
+    /// Backwards-compatible alias — routes through the anonymous path
+    /// on modern servers, which is what most callers actually want.
+    public static let guest = SMBCredentials.anonymous
 }
 
 // MARK: - Session
@@ -232,51 +257,69 @@ public actor SMBSession {
         let ntlmChallengeToken = try SPNEGO.extractNTLMToken(setup1Resp.securityBuffer)
         let challenge = try NTLMv2.parseChallenge(ntlmChallengeToken)
 
-        // Pick the domain: prefer the one provided, otherwise use the
-        // target name the server advertised, otherwise empty.
-        let domain = credentials.domain.isEmpty
-            ? challenge.targetName
-            : credentials.domain
+        // Build the AUTHENTICATE message — anonymous or NTLMv2.
+        let ntlmAuthenticate: Data
+        let sessionBaseKey: Data
 
-        let ntHash     = NTLMv2.ntHash(password: credentials.password)
-        let ntlmv2Hash = NTLMv2.ntlmv2Hash(
-            ntHash: ntHash,
-            user:   credentials.user,
-            domain: domain
-        )
-
-        // Build the client blob using the server's AV_PAIR target info.
-        let timestamp: UInt64
-        if let tsData = NTLMv2.parseAvPairs(challenge.targetInfo)[NTLMv2.AvId.timestamp],
-           tsData.count >= 8 {
-            var tmp: UInt64 = 0
-            for i in 0..<8 {
-                tmp |= UInt64(tsData[tsData.startIndex + i]) << (8 * i)
-            }
-            timestamp = tmp
+        if credentials.isAnonymous {
+            // Anonymous / null-session path. Matches Finder's behavior
+            // for bare `smb://host` — the server replies with
+            // SMB2_SESSION_FLAG_IS_NULL and grants IPC$ access.
+            ntlmAuthenticate = NTLMv2.authenticateAnonymous(
+                challengeFlags: challenge.flags,
+                workstation: credentials.workstation
+            )
+            // No session base key derivable from an anonymous exchange.
+            sessionBaseKey = Data()
         } else {
-            timestamp = NTLMv2.currentFileTime()
+            // Pick the domain: prefer the one provided, otherwise use the
+            // target name the server advertised, otherwise empty.
+            let domain = credentials.domain.isEmpty
+                ? challenge.targetName
+                : credentials.domain
+
+            let ntHash     = NTLMv2.ntHash(password: credentials.password)
+            let ntlmv2Hash = NTLMv2.ntlmv2Hash(
+                ntHash: ntHash,
+                user:   credentials.user,
+                domain: domain
+            )
+
+            // Build the client blob using the server's AV_PAIR target info.
+            let timestamp: UInt64
+            if let tsData = NTLMv2.parseAvPairs(challenge.targetInfo)[NTLMv2.AvId.timestamp],
+               tsData.count >= 8 {
+                var tmp: UInt64 = 0
+                for i in 0..<8 {
+                    tmp |= UInt64(tsData[tsData.startIndex + i]) << (8 * i)
+                }
+                timestamp = tmp
+            } else {
+                timestamp = NTLMv2.currentFileTime()
+            }
+
+            let clientChallenge = NTLMv2.randomChallenge()
+            let clientBlob = NTLMv2.buildClientBlob(
+                timestamp:       timestamp,
+                clientChallenge: clientChallenge,
+                targetInfo:      challenge.targetInfo
+            )
+
+            let (_, ntChallengeResponse, baseKey) = NTLMv2.computeResponse(
+                ntlmv2Hash:      ntlmv2Hash,
+                serverChallenge: challenge.serverChallenge,
+                clientBlob:      clientBlob
+            )
+            sessionBaseKey = baseKey
+
+            ntlmAuthenticate = NTLMv2.authenticate(
+                flags: challenge.flags,
+                ntChallengeResponse: ntChallengeResponse,
+                domain: domain,
+                user:   credentials.user,
+                workstation: credentials.workstation
+            )
         }
-
-        let clientChallenge = NTLMv2.randomChallenge()
-        let clientBlob = NTLMv2.buildClientBlob(
-            timestamp:       timestamp,
-            clientChallenge: clientChallenge,
-            targetInfo:      challenge.targetInfo
-        )
-
-        let (_, ntChallengeResponse, sessionBaseKey) = NTLMv2.computeResponse(
-            ntlmv2Hash:      ntlmv2Hash,
-            serverChallenge: challenge.serverChallenge,
-            clientBlob:      clientBlob
-        )
-
-        let ntlmAuthenticate = NTLMv2.authenticate(
-            flags: challenge.flags,
-            ntChallengeResponse: ntChallengeResponse,
-            domain: domain,
-            user:   credentials.user
-        )
 
         // Round 2: wrap the NTLM AUTHENTICATE in SPNEGO NegTokenResp.
         let spnegoResp = SPNEGO.wrapNegTokenResp(ntlmAuthenticate: ntlmAuthenticate)
@@ -286,9 +329,21 @@ public actor SMBSession {
             command: SMB2Command.sessionSetup,
             body: setup2Body
         )
+        // SMB2_SESSION_FLAG_IS_GUEST (0x0001) and IS_NULL (0x0002) are
+        // *not* failures — the server completed auth with reduced
+        // privileges. The SMB2 header status is STATUS_SUCCESS in both
+        // cases, so isSuccess is the only thing we need to check.
         guard header2.isSuccess else {
             sessionId = 0
-            throw SMBError.authenticationFailed
+            // Map recognized NTSTATUS codes so callers see a precise error.
+            if header2.status == NTStatus.logonFailure
+                || header2.status == NTStatus.accountRestriction
+                || header2.status == NTStatus.passwordExpired
+                || header2.status == NTStatus.noSuchUser
+                || header2.status == NTStatus.wrongPassword {
+                throw SMBError.authenticationFailed
+            }
+            throw SMBError.ntStatus(header2.status)
         }
 
         // ── Derive the signing key from the session base key ───────────
@@ -298,7 +353,12 @@ public actor SMBSession {
         // but every consumer NAS we target (Synology, QNAP, Samba) accepts
         // the raw session base key as well. Using it directly keeps the
         // code simple and maximizes compatibility.
-        signingKey = SymmetricKey(data: sessionBaseKey)
+        //
+        // An anonymous session has no base key and therefore can't sign —
+        // that's fine, servers that allow anonymous IPC$ don't require it.
+        signingKey = sessionBaseKey.isEmpty
+            ? nil
+            : SymmetricKey(data: sessionBaseKey)
     }
 
     /// Bind to a share via TREE_CONNECT.

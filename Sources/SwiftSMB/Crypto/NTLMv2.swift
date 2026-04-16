@@ -29,6 +29,25 @@ public enum NTLMv2 {
     public static let typeChallenge:    UInt32 = 2
     public static let typeAuthenticate: UInt32 = 3
 
+    // NTLMSSP Negotiate flags ([MS-NLMP] §2.2.2.5). We keep the ones we
+    // actually set or test named; the rest stay as raw bit patterns.
+    public enum Flag {
+        public static let unicode:                   UInt32 = 0x0000_0001
+        public static let requestTarget:             UInt32 = 0x0000_0004
+        public static let sign:                      UInt32 = 0x0000_0010
+        public static let seal:                      UInt32 = 0x0000_0020
+        public static let ntlm:                      UInt32 = 0x0000_0200
+        public static let anonymous:                 UInt32 = 0x0000_0800
+        public static let alwaysSign:                UInt32 = 0x0000_8000
+        public static let extendedSessionSecurity:   UInt32 = 0x0008_0000
+        public static let targetTypeServer:          UInt32 = 0x0002_0000
+        public static let targetInfo:                UInt32 = 0x0080_0000
+        public static let version:                   UInt32 = 0x0200_0000
+        public static let key128:                    UInt32 = 0x2000_0000
+        public static let keyExch:                   UInt32 = 0x4000_0000
+        public static let key56:                     UInt32 = 0x8000_0000
+    }
+
     // ── Key derivation ──────────────────────────────────────────────────
 
     /// NT Hash: MD4(UTF-16LE(password)).
@@ -109,22 +128,36 @@ public enum NTLMv2 {
 
     // ── NTLM message builders ───────────────────────────────────────────
 
+    /// Default flag set for the Type 1 (NEGOTIATE) message.
+    ///
+    /// Includes SIGN + KEY_EXCH so servers that mandate SMB signing
+    /// (TrueNAS Scale, Windows Server with "RequireSecuritySignature",
+    /// Samba with `server signing = mandatory`) don't reject the
+    /// SessionSetup. Also includes TARGET_INFO and 128-bit key
+    /// capabilities so the server emits a proper AV_PAIR blob.
+    public static let defaultNegotiateFlags: UInt32 =
+        Flag.unicode |
+        Flag.requestTarget |
+        Flag.sign |
+        Flag.ntlm |
+        Flag.alwaysSign |
+        Flag.extendedSessionSecurity |
+        Flag.targetInfo |
+        Flag.version |
+        Flag.key128 |
+        Flag.keyExch |
+        Flag.key56
+
     /// Build a Type 1 (NEGOTIATE) message.
     ///
-    /// We request NTLMv2, Unicode, and request-target flags.
-    /// No domain/workstation strings needed for anonymous negotiate.
-    public static func negotiate() -> Data {
+    /// `additionalFlags` is OR'd into the default flag set — set
+    /// `Flag.anonymous` for a null session.
+    public static func negotiate(additionalFlags: UInt32 = 0) -> Data {
         var w = ByteWriter()
         w.bytes(signature)
         w.uint32le(typeNegotiate)
 
-        // NegotiateFlags:
-        //   NTLMSSP_NEGOTIATE_UNICODE       (0x01)
-        //   NTLMSSP_NEGOTIATE_NTLM          (0x200)
-        //   NTLMSSP_REQUEST_TARGET           (0x04)
-        //   NTLMSSP_NEGOTIATE_EXTENDED_SESSIONSECURITY (0x80000)
-        //   NTLMSSP_NEGOTIATE_ALWAYS_SIGN    (0x8000)
-        let flags: UInt32 = 0x00088207
+        let flags: UInt32 = defaultNegotiateFlags | additionalFlags
         w.uint32le(flags)
 
         // DomainNameFields (offset/length = 0, we don't send one)
@@ -191,6 +224,67 @@ public enum NTLMv2 {
             targetName: targetName,
             targetInfo: targetInfo
         )
+    }
+
+    /// Build an anonymous Type 3 (AUTHENTICATE) message.
+    ///
+    /// Per [MS-NLMP] §3.2.5.1.2, an anonymous NTLMSSP_AUTHENTICATE
+    /// carries empty LM/NT responses, empty user/domain/workstation,
+    /// and sets `NTLMSSP_NEGOTIATE_ANONYMOUS` in the flag word. The
+    /// LmChallengeResponse is a single zero byte; the NtChallengeResponse
+    /// is empty. Servers reply with `SMB2_SESSION_FLAG_IS_NULL`.
+    public static func authenticateAnonymous(
+        challengeFlags: UInt32,
+        workstation: String = ""
+    ) -> Data {
+        let wsBytes    = workstation.utf16leData
+        // Anonymous marker: 1-byte LM response, 0-byte NT response.
+        let lmResponse = Data([0x00])
+        let ntResponse = Data()
+
+        let headerSize = 88
+        var offset = headerSize
+
+        func advance(_ count: Int) -> (offset: UInt32, length: UInt16) {
+            let o = offset
+            offset += count
+            return (UInt32(o), UInt16(count))
+        }
+
+        let lmField     = advance(lmResponse.count)
+        let ntField     = advance(ntResponse.count)
+        let domainField = advance(0)
+        let userField   = advance(0)
+        let wsField     = advance(wsBytes.count)
+        let skField     = advance(0)
+
+        // Strip the KEY_EXCH bit (no session key to exchange) and add
+        // the ANONYMOUS marker.
+        let flags = (challengeFlags & ~Flag.keyExch) | Flag.anonymous
+
+        var w = ByteWriter()
+        w.bytes(signature)
+        w.uint32le(typeAuthenticate)
+
+        func writeBuf(_ field: (offset: UInt32, length: UInt16)) {
+            w.uint16le(field.length)
+            w.uint16le(field.length)
+            w.uint32le(field.offset)
+        }
+        writeBuf(lmField)
+        writeBuf(ntField)
+        writeBuf(domainField)
+        writeBuf(userField)
+        writeBuf(wsField)
+        writeBuf(skField)
+        w.uint32le(flags)
+
+        w.bytes(lmResponse)
+        w.bytes(ntResponse)
+        // domain, user empty
+        w.bytes(wsBytes)
+
+        return w.data
     }
 
     /// Build a Type 3 (AUTHENTICATE) message.
