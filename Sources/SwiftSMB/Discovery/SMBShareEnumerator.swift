@@ -83,16 +83,24 @@ public enum SMBShareEnumerator {
 
         try await session.connectShare(ipcPath, credentials: credentials)
 
-        let shares = try await enumerateShares(session: session)
+        let shares = try await enumerateShares(session: session, serverName: host)
         await session.disconnect()
         return shares
     }
 
     /// Enumerate shares using an already-connected session. The session
     /// must be tree-connected to "IPC$".
+    ///
+    /// - `serverName`: optional override for the NetShareEnumAll
+    ///   `ServerName` field. If `nil`, the host stored on the session is
+    ///   used. Strict Samba (4.x+, TrueNAS Scale) rejects an empty
+    ///   ServerName with STATUS_INVALID_PARAMETER, so we always send
+    ///   `\\<host>` here.
     public static func enumerateShares(
-        session: SMBSession
+        session: SMBSession,
+        serverName: String? = nil
     ) async throws -> [SMBShareInfo] {
+        let resolvedName = serverName ?? (await session.currentHost)
         // Open the srvsvc named pipe.
         let pipeBody = SMB2CreateRequest.build(
             path: "srvsvc",
@@ -121,7 +129,7 @@ public enum SMBShareEnumerator {
             }
 
             // Step 2: NetShareEnumAll (opnum 15).
-            let enumData = buildNetShareEnumAll()
+            let enumData = buildNetShareEnumAll(serverName: resolvedName)
             try await writePipe(session: session, fileId: fileId, data: enumData)
             let enumResp = try await readPipe(session: session, fileId: fileId)
 
@@ -244,7 +252,11 @@ public enum SMBShareEnumerator {
     // MARK: - NetShareEnumAll
 
     /// Build a DCE/RPC Request PDU for NetShareEnumAll (opnum 15).
-    private static func buildNetShareEnumAll() -> Data {
+    ///
+    /// `serverName` is sent as the NDR `ServerName` parameter wrapped in
+    /// `\\HOST` form — strict Samba rejects an empty server name with
+    /// STATUS_INVALID_PARAMETER, and Windows happily accepts the UNC.
+    private static func buildNetShareEnumAll(serverName: String) -> Data {
         var w = ByteWriter()
         // RPC Header
         w.uint8(5)             // rpc_vers
@@ -262,31 +274,45 @@ public enum SMBShareEnumerator {
         w.uint16le(0)          // context_id
         w.uint16le(15)         // opnum = NetShareEnumAll
 
-        // Stub data (NDR-encoded NetShareEnumAll parameters)
-        // ServerName: unique pointer to a conformant varying UTF-16LE string.
-        // We pass a single null terminator (L"\0") meaning "this server".
-        w.uint32le(0x00020000) // referent id (non-null → string follows)
-        // NDR conformant varying string: max_count, offset, actual_count, chars
-        // actual_count includes the null terminator (1 wchar = 1).
-        w.uint32le(1)          // max_count  (1 wchar capacity)
-        w.uint32le(0)          // offset     (always 0)
-        w.uint32le(1)          // actual_count (1 wchar including null)
-        w.uint16le(0)          // the null terminator (UTF-16LE)
-        w.zeros(2)             // padding to 4-byte boundary
+        // ── Stub data (NDR-encoded NetShareEnumAll parameters) ─────────
+        // ServerName: unique pointer to a conformant varying UTF-16LE
+        // string. Per [MS-SRVS] §3.1.4.8 the string is a UNC of the form
+        // `\\<server>\0` (NUL-terminated). Empty / NULL ServerName is
+        // legal on Windows but rejected by Samba 4.x with
+        // STATUS_INVALID_PARAMETER, so we always send a real name.
+        let unc = serverName.hasPrefix("\\\\") ? serverName : "\\\\\(serverName)"
+        let serverChars = Array(unc.utf16) + [0]            // UTF-16 + NUL
+        let serverByteCount = serverChars.count * 2
+        let charCount = UInt32(serverChars.count)
 
-        // InfoStruct
+        w.uint32le(0x00020000)            // referent id (non-null)
+        w.uint32le(charCount)             // max_count   (capacity in wchars)
+        w.uint32le(0)                     // offset
+        w.uint32le(charCount)             // actual_count (incl. NUL)
+        for cu in serverChars {           // UTF-16LE characters
+            w.uint16le(cu)
+        }
+        // Pad to 4-byte alignment for the next NDR primitive (Level).
+        // Header so far:
+        //   referent(4) + max(4) + offset(4) + actual(4) + chars(2*N)
+        // = 16 + 2*N  — pad if N is odd.
+        let stubBytesAfterServer = 16 + serverByteCount
+        let pad = (4 - (stubBytesAfterServer % 4)) % 4
+        if pad > 0 { w.zeros(pad) }
+
+        // InfoStruct (SHARE_ENUM_STRUCT)
         w.uint32le(1)          // Level = 1 (SHARE_INFO_1)
         w.uint32le(1)          // Switch value = 1
         // SHARE_INFO_1_CONTAINER
-        w.uint32le(0x00020004) // referent id for entries pointer
-        w.uint32le(0)          // EntriesRead
-        w.uint32le(0)          // null Buffer pointer
+        w.uint32le(0x00020004) // referent id for the container
+        w.uint32le(0)          // EntriesRead (server fills this in on response)
+        w.uint32le(0)          // NULL Buffer pointer (no input array)
 
-        // PrefMaxLen
+        // PreferedMaximumLength
         w.uint32le(0xFFFFFFFF) // -1 = no limit
 
-        // ResumeHandle (unique pointer)
-        w.uint32le(0x00020008) // referent id
+        // ResumeHandle (unique pointer to ULONG, value = 0)
+        w.uint32le(0x00020008) // referent id (non-null per [MS-SRVS])
         w.uint32le(0)          // ResumeHandle value
 
         // Fix up frag length

@@ -64,9 +64,14 @@ public actor SMBClient {
         if share.hasPrefix("\\\\") || share.hasPrefix("//") {
             fullPath = share.replacingOccurrences(of: "/", with: "\\")
         } else {
-            // Use an empty host in the UNC — TREE_CONNECT tolerates this
-            // form and servers fall back to the already-connected host.
-            fullPath = "\\\\\(host(for: session))\\\(share)"
+            // Build a real UNC `\\HOST\share`. Earlier versions used an
+            // empty host (`\\\share`) hoping the server would substitute
+            // its own name, but Samba 4.x and TrueNAS Scale reject that
+            // form with STATUS_INVALID_PARAMETER on TREE_CONNECT. Modern
+            // Samba parses the UNC strictly and requires a non-empty
+            // hostname.
+            let h = await session.currentHost
+            fullPath = "\\\\\(h)\\\(share)"
         }
         try await session.connectShare(fullPath, credentials: credentials)
     }
@@ -611,13 +616,6 @@ public actor SMBClient {
         if !header.isSuccess {
             throw Self.mapNTStatus(header.status, path: "")
         }
-    }
-
-    /// Session doesn't expose its host directly; we only call this when
-    /// the caller gave us a bare share name, in which case we fall back
-    /// to the empty "\\\\\\" prefix which every known SMB server accepts.
-    private func host(for session: SMBSession) -> String {
-        ""
     }
 
     // MARK: - Static helpers

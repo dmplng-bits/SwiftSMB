@@ -109,6 +109,7 @@ public enum SMBError: LocalizedError {
 private func ntStatusDescription(_ code: UInt32) -> String {
     switch code {
     case 0x00000000: return "SUCCESS"
+    case 0xC000000D: return "INVALID_PARAMETER — server rejected the request structure (often a malformed UNC path or NDR-encoded RPC argument)"
     case 0xC0000016: return "MORE_PROCESSING_REQUIRED"
     case 0xC0000022: return "ACCESS_DENIED"
     case 0xC0000034: return "OBJECT_NAME_NOT_FOUND"

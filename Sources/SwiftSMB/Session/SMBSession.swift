@@ -168,6 +168,14 @@ public actor SMBSession {
     public var currentMessageId: UInt64 { messageId }
     public var currentCredits:   UInt16 { creditsAvailable }
 
+    /// Host the underlying transport is targeting. Used by the Client
+    /// layer to build proper UNC paths (`\\HOST\share`) and by the share
+    /// enumerator to populate the `ServerName` field of NetShareEnumAll.
+    /// An empty `\\\share` UNC is rejected by strict Samba builds with
+    /// STATUS_INVALID_PARAMETER, which is why we plumb the host through.
+    public var currentHost: String { transport.host }
+    public var currentPort: UInt16 { transport.port }
+
     // MARK: - Lifecycle
 
     /// Run the full handshake: TCP connect → NEGOTIATE → NTLMv2 → TREE_CONNECT.

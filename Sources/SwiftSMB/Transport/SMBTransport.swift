@@ -86,6 +86,16 @@ public actor SMBTransport {
         self.init(endpoint: Endpoint(host: host, port: port))
     }
 
+    /// Host this transport connects to. Used by upper layers when they
+    /// need to build a UNC path (e.g. `\\HOST\share`) without forcing the
+    /// caller to pass the host twice.
+    ///
+    /// Marked `nonisolated` because `endpoint` is an immutable `let` that
+    /// is fixed at init time — actor isolation would force every caller
+    /// to `await`, which is needless ceremony for a constant read.
+    public nonisolated var host: String { endpoint.host }
+    public nonisolated var port: UInt16 { endpoint.port }
+
     // MARK: - Lifecycle
 
     /// Establish a TCP connection to the server.
