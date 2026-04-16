@@ -79,6 +79,29 @@ public enum SMB2Dialect {
     public static let wildcard: UInt16 = 0x02FF
 }
 
+// MARK: - Negotiate Context types ([MS-SMB2] §2.2.3.1)
+
+public enum SMB2NegotiateContext {
+    public static let preauthIntegrityCapabilities: UInt16 = 0x0001
+    public static let encryptionCapabilities:       UInt16 = 0x0002
+    public static let compressionCapabilities:      UInt16 = 0x0003
+    public static let netnameNegotiateContextId:    UInt16 = 0x0005
+    public static let transportCapabilities:        UInt16 = 0x0006
+    public static let rdmaTransformCapabilities:    UInt16 = 0x0007
+    public static let signingCapabilities:          UInt16 = 0x0008
+}
+
+public enum SMB2HashAlgorithm {
+    public static let sha512: UInt16 = 0x0001
+}
+
+public enum SMB2Cipher {
+    public static let aes128ccm: UInt16 = 0x0001
+    public static let aes128gcm: UInt16 = 0x0002
+    public static let aes256ccm: UInt16 = 0x0003
+    public static let aes256gcm: UInt16 = 0x0004
+}
+
 // MARK: - Capabilities ([MS-SMB2] §2.2.3)
 
 public enum SMB2Capabilities {

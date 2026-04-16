@@ -406,3 +406,134 @@ func hmacMD5(key: Data, data: Data) -> Data {
     let mac = HMAC<Insecure.MD5>.authenticationCode(for: data, using: symmetricKey)
     return Data(mac)
 }
+
+// MARK: - SP800-108 KDF (Counter Mode) for SMB 3.x key derivation
+
+/// NIST SP 800-108 §5.1 HMAC-SHA256 counter-mode KDF, as used by
+/// SMB 3.x for signing/encryption key derivation ([MS-SMB2] §3.1.4.2).
+///
+/// One iteration is enough for SMB's L=128 case (16-byte output)
+/// because HMAC-SHA256 already produces 32 bytes.
+///
+/// Format of each block's input:
+///     [i]₄ || Label || 0x00 || Context || [L]₄
+/// where [i] and [L] are big-endian 32-bit integers.
+public func smbKDF(
+    key: Data,
+    label: Data,
+    context: Data,
+    outputLength: Int = 16
+) -> Data {
+    // L is the *bit length* of the desired output, big-endian.
+    let L = UInt32(outputLength * 8)
+
+    var input = Data()
+    // Counter i = 1 (big-endian).
+    input.append(0x00)
+    input.append(0x00)
+    input.append(0x00)
+    input.append(0x01)
+    input.append(label)
+    input.append(0x00)           // null separator
+    input.append(context)
+    // [L]₄ big-endian
+    input.append(UInt8((L >> 24) & 0xFF))
+    input.append(UInt8((L >> 16) & 0xFF))
+    input.append(UInt8((L >>  8) & 0xFF))
+    input.append(UInt8( L        & 0xFF))
+
+    let mac = HMAC<SHA256>.authenticationCode(
+        for: input,
+        using: SymmetricKey(data: key)
+    )
+    return Data(mac).prefix(outputLength)
+}
+
+/// Helper: string with appended NUL terminator, matching how [MS-SMB2]
+/// defines Label and Context values for the SP800-108 KDF.
+/// Windows/Samba/impacket all include the trailing NUL in the input.
+private func asciiZ(_ s: String) -> Data {
+    var d = Data(s.utf8)
+    d.append(0x00)
+    return d
+}
+
+/// Derive the SMB signing key per [MS-SMB2] §3.1.4.2.
+///
+/// - `sessionBaseKey`: the 16-byte NTLMv2 session base key.
+/// - `dialect`: negotiated SMB2 dialect (`SMB2Dialect.*`).
+/// - `preauthIntegrityHash`: 64-byte SHA-512 hash of NEGOTIATE +
+///   SESSION_SETUP messages. Required for SMB 3.1.1. Ignored otherwise.
+public func smbDeriveSigningKey(
+    sessionBaseKey: Data,
+    dialect: UInt16,
+    preauthIntegrityHash: Data
+) -> Data {
+    switch dialect {
+    case SMB2Dialect.smb300, SMB2Dialect.smb302:
+        return smbKDF(
+            key:     sessionBaseKey,
+            label:   asciiZ("SMB2AESCMAC"),
+            context: asciiZ("SmbSign")
+        )
+    case SMB2Dialect.smb311:
+        return smbKDF(
+            key:     sessionBaseKey,
+            label:   asciiZ("SMBSigningKey"),
+            context: preauthIntegrityHash
+        )
+    default:
+        // SMB 2.0.2 / 2.1.x: signing key IS the session base key.
+        return sessionBaseKey
+    }
+}
+
+/// Derive the SMB 3.x encryption key pair per [MS-SMB2] §3.1.4.2.
+///
+/// Returns `(encryption, decryption)` where:
+/// * `encryption` is used to seal client-to-server traffic.
+/// * `decryption` is used to open server-to-client traffic.
+///
+/// Returns `nil` for dialects that don't support encryption (2.x).
+public func smbDeriveEncryptionKeys(
+    sessionBaseKey: Data,
+    dialect: UInt16,
+    preauthIntegrityHash: Data
+) -> (encryption: Data, decryption: Data)? {
+    switch dialect {
+    case SMB2Dialect.smb300, SMB2Dialect.smb302:
+        // SMB 3.0 / 3.0.2 use the CCM label for both keys; the context
+        // byte-string ("ServerIn " / "ServerOut") selects direction.
+        // Note the trailing space in "ServerIn " — it's 9 characters
+        // plus the NUL terminator, matching "ServerOut\0" length.
+        let enc = smbKDF(
+            key:     sessionBaseKey,
+            label:   asciiZ("SMB2AESCCM"),
+            context: asciiZ("ServerIn ")
+        )
+        let dec = smbKDF(
+            key:     sessionBaseKey,
+            label:   asciiZ("SMB2AESCCM"),
+            context: asciiZ("ServerOut")
+        )
+        return (enc, dec)
+
+    case SMB2Dialect.smb311:
+        // 3.1.1 uses separate labels per direction; the context is the
+        // preauth integrity hash (already captured in the session).
+        let enc = smbKDF(
+            key:     sessionBaseKey,
+            label:   asciiZ("SMBC2SCipherKey"),
+            context: preauthIntegrityHash
+        )
+        let dec = smbKDF(
+            key:     sessionBaseKey,
+            label:   asciiZ("SMBS2CCipherKey"),
+            context: preauthIntegrityHash
+        )
+        return (enc, dec)
+
+    default:
+        return nil
+    }
+}

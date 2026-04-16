@@ -26,11 +26,18 @@ import CryptoKit
 
 /// The username/password/domain bundle handed to `SMBSession.authenticate`.
 ///
-/// For unauthenticated access, prefer `.anonymous` over passing empty
-/// strings for user/password. Anonymous and guest are *different* auth
-/// modes on the wire — modern Samba, TrueNAS Scale, and Windows Server
-/// reject "guest" by default but still allow anonymous IPC$ connections.
+/// For unauthenticated access, use `.anonymous` explicitly.
+/// Anonymous and guest are *different* auth modes on the wire — modern
+/// Samba, TrueNAS Scale, and Windows Server reject "guest" by default
+/// but still allow anonymous IPC$ connections.
 /// See [MS-NLMP] §3.2.5.1.2 (NTLMSSP_NEGOTIATE_ANONYMOUS).
+///
+/// ## Security note
+/// An anonymous / null session carries **no signing key** — every
+/// request and response travels the wire unsigned and can be tampered
+/// with by an on-path attacker. Use `.anonymous` only for browsing
+/// public shares on trusted networks (home LAN, VPN). For anything
+/// that reads private data or performs writes, pass real credentials.
 public struct SMBCredentials: Sendable {
     public let user:        String
     public let password:    String
@@ -49,19 +56,26 @@ public struct SMBCredentials: Sendable {
         self.password    = password
         self.domain      = domain
         self.workstation = workstation
-        // Auto-detect anonymous if caller passed empty creds and didn't
-        // opt out. Matches Finder's behavior for bare `smb://host`.
-        self.isAnonymous = isAnonymous || (user.isEmpty && password.isEmpty)
+        // Anonymous must be explicit — callers that genuinely want a
+        // null session use `.anonymous` or pass `isAnonymous: true`.
+        // Empty strings with `isAnonymous: false` send a real NTLMv2
+        // AUTHENTICATE with an empty username, which some servers
+        // accept and others reject (that's the caller's choice).
+        self.isAnonymous = isAnonymous
     }
 
     /// Explicit anonymous (null-session) access. Emits an empty
     /// NTLMSSP AUTHENTICATE message with the anonymous flag set.
+    ///
+    /// - Warning: Traffic on an anonymous session is unsigned. Only
+    ///   use this on trusted networks.
     public static let anonymous = SMBCredentials(
         user: "", password: "", domain: "", workstation: "", isAnonymous: true
     )
 
-    /// Backwards-compatible alias — routes through the anonymous path
-    /// on modern servers, which is what most callers actually want.
+    /// Backwards-compatible alias. Modern servers reject a literal
+    /// "guest" NTLMv2 logon, so we route this to the anonymous path
+    /// where it's most likely to succeed.
     public static let guest = SMBCredentials.anonymous
 }
 
@@ -89,11 +103,37 @@ public actor SMBSession {
     private var creditsAvailable: UInt16 = 0
 
     // ── Signing ────────────────────────────────────────────────────────
-    // After a successful SESSION_SETUP the session base key is used to
-    // derive a signing key. All outgoing packets get an HMAC-SHA256 in
-    // the Signature field, and all incoming responses are verified.
+    // After a successful SESSION_SETUP the session base key is run
+    // through the SP800-108 KDF (for SMB 3.x) to derive a signing key.
+    // All outgoing packets get an HMAC-SHA256 tag in the Signature
+    // field, and all incoming responses are verified.
+    //
+    // NOTE: [MS-SMB2] §3.1.4.1 says SMB 3.x uses AES-CMAC-128 rather
+    // than HMAC-SHA256. We still compute HMAC-SHA256 here; servers that
+    // don't enforce strict signature verification accept it, and a
+    // correctly-derived key is a prerequisite for a future AES-CMAC
+    // upgrade. See `computeSignature` for the algorithm call site.
     private var signingKey: SymmetricKey?
     private var signingRequired: Bool = false
+
+    // ── SMB 3.1.1 preauth integrity ────────────────────────────────────
+    // SHA-512 running hash of NEGOTIATE + SESSION_SETUP messages. Fed
+    // as the Context into the signing key KDF for the 3.1.1 dialect.
+    // `preauthActive` is true from the start of `negotiate()` until
+    // signing-key derivation in `authenticate()`.
+    private var preauthIntegrityHash: Data = Data(count: 64)
+    private var preauthActive: Bool = false
+
+    // ── Encryption (SMB 3.x only) ──────────────────────────────────────
+    // When `encryptionEnabled` is true, outgoing packets are wrapped in
+    // an SMB2 TRANSFORM_HEADER using `encryptionKey` (AES-128-GCM) and
+    // inbound transform-wrapped responses are decrypted with
+    // `decryptionKey`. Turned on when the server requests it via
+    // SMB2_SESSION_FLAG_ENCRYPT_DATA (session-wide) or
+    // SMB2_SHAREFLAG_ENCRYPT_DATA (per share).
+    private var encryptionKey: Data = Data()
+    private var decryptionKey: Data = Data()
+    private var encryptionEnabled: Bool = false
 
     // ── ECHO keepalive ─────────────────────────────────────────────────
     private var keepaliveTask: Task<Void, Never>?
@@ -165,6 +205,9 @@ public actor SMBSession {
             sessionId = 0
         }
         signingKey = nil
+        encryptionKey = Data()
+        decryptionKey = Data()
+        encryptionEnabled = false
         await transport.disconnect()
     }
 
@@ -183,6 +226,9 @@ public actor SMBSession {
         // is already dead if we're reconnecting.
         stopKeepalive()
         signingKey = nil
+        encryptionKey = Data()
+        decryptionKey = Data()
+        encryptionEnabled = false
         sessionId = 0
         treeId    = 0
         messageId = 0
@@ -205,6 +251,11 @@ public actor SMBSession {
 
     /// Send NEGOTIATE and cache the server's capabilities + security blob.
     public func negotiate() async throws {
+        // Reset preauth state and start hashing all NEG / SESSION_SETUP
+        // messages — required by SMB 3.1.1, harmless for older dialects.
+        preauthIntegrityHash = Data(count: 64)
+        preauthActive = true
+
         let body = SMB2NegotiateRequest.build()
         let (header, respBody) = try await sendRequest(
             command: SMB2Command.negotiate,
@@ -225,7 +276,8 @@ public actor SMBSession {
             maxTransactSize: parsed.maxTransactSize,
             serverGuid:      parsed.serverGuid,
             securityBuffer:  parsed.securityBuffer,
-            securityMode:    parsed.securityMode
+            securityMode:    parsed.securityMode,
+            chosenCipher:    parsed.chosenCipher
         )
     }
 
@@ -325,7 +377,7 @@ public actor SMBSession {
         let spnegoResp = SPNEGO.wrapNegTokenResp(ntlmAuthenticate: ntlmAuthenticate)
         let setup2Body = SMB2SessionSetupRequest.build(securityBuffer: spnegoResp)
 
-        let (header2, _) = try await sendRequest(
+        let (header2, respBody2) = try await sendRequest(
             command: SMB2Command.sessionSetup,
             body: setup2Body
         )
@@ -347,18 +399,75 @@ public actor SMBSession {
         }
 
         // ── Derive the signing key from the session base key ───────────
-        // [MS-SMB2] §3.2.5.3.1: For SMB 2.0.2 and 2.1, the signing key
-        // IS the session base key directly. For SMB 3.x the spec says to
-        // use KDF(SP800-108) with Label "SMB2AESCMAC" / Context "SmbSign",
-        // but every consumer NAS we target (Synology, QNAP, Samba) accepts
-        // the raw session base key as well. Using it directly keeps the
-        // code simple and maximizes compatibility.
+        // [MS-SMB2] §3.1.4.2: SMB 2.x uses the session base key directly;
+        // SMB 3.x runs it through SP800-108 HMAC-SHA256 KDF with a
+        // dialect-specific label and context. 3.1.1 additionally mixes
+        // in the preauth-integrity hash computed over NEGOTIATE +
+        // SESSION_SETUP messages.
         //
         // An anonymous session has no base key and therefore can't sign —
         // that's fine, servers that allow anonymous IPC$ don't require it.
-        signingKey = sessionBaseKey.isEmpty
-            ? nil
-            : SymmetricKey(data: sessionBaseKey)
+        if sessionBaseKey.isEmpty {
+            signingKey = nil
+            encryptionKey = Data()
+            decryptionKey = Data()
+        } else {
+            let dialect = negotiated?.dialect ?? SMB2Dialect.smb202
+            let derived = smbDeriveSigningKey(
+                sessionBaseKey:       sessionBaseKey,
+                dialect:              dialect,
+                preauthIntegrityHash: preauthIntegrityHash
+            )
+            signingKey = SymmetricKey(data: derived)
+
+            // Derive the encryption key pair for 3.x. No-op on 2.x.
+            if let keys = smbDeriveEncryptionKeys(
+                sessionBaseKey:       sessionBaseKey,
+                dialect:              dialect,
+                preauthIntegrityHash: preauthIntegrityHash
+            ) {
+                encryptionKey = keys.encryption
+                decryptionKey = keys.decryption
+            } else {
+                encryptionKey = Data()
+                decryptionKey = Data()
+            }
+        }
+
+        // Preauth hash is frozen now — stop hashing subsequent traffic.
+        preauthActive = false
+
+        // Session-level encryption requirement: if the server set
+        // ENCRYPT_DATA in the SessionFlags, every request after this
+        // point must be wrapped in a transform header. We only enable
+        // this if we can actually honor it — meaning 3.1.1 picked
+        // AES-128-GCM. For 3.0/3.0.2 (CCM only) or GCM not chosen, we
+        // leave encryption off and let the server reject traffic
+        // rather than sending packets we can't wrap correctly.
+        if let setup2Resp = try? SMB2SessionSetupResponse.parse(respBody2),
+           (setup2Resp.sessionFlags & SMB2SessionFlags.encryptData) != 0,
+           canEncrypt() {
+            encryptionEnabled = true
+        }
+    }
+
+    /// Returns true when we have working encryption material — i.e., the
+    /// negotiated dialect supports it, the server picked a cipher we
+    /// implement (AES-128-GCM), and our key pair is populated.
+    private func canEncrypt() -> Bool {
+        guard !encryptionKey.isEmpty, !decryptionKey.isEmpty else { return false }
+        let dialect = negotiated?.dialect ?? 0
+        if dialect == SMB2Dialect.smb311 {
+            return negotiated?.chosenCipher == SMB2Cipher.aes128gcm
+        }
+        // 3.0/3.0.2 only offer CCM in the spec — we don't support it.
+        return false
+    }
+
+    // SHA-512 hash helper — used to update the preauth integrity value
+    // between handshake messages.
+    private func sha512(_ data: Data) -> Data {
+        Data(SHA512.hash(data: data))
     }
 
     /// Bind to a share via TREE_CONNECT.
@@ -375,8 +484,16 @@ public actor SMBSession {
         guard header.isSuccess else {
             throw SMBError.ntStatus(header.status)
         }
-        _ = try SMB2TreeConnectResponse.parse(respBody)
+        let parsed = try SMB2TreeConnectResponse.parse(respBody)
         self.treeId = header.treeId
+
+        // Per-share encryption: if the server set ENCRYPT_DATA in the
+        // share flags, all subsequent traffic on this tree must be
+        // encrypted. We can only honor this on 3.1.1 + GCM.
+        if (parsed.shareFlags & SMB2ShareFlags.encryptData) != 0,
+           canEncrypt() {
+            encryptionEnabled = true
+        }
     }
 
     // MARK: - ECHO keepalive
@@ -472,12 +589,34 @@ public actor SMBSession {
             // This is complex — for now, sign the whole compound as one.
             // (Most NAS accept this for related compounds.)
             Self.setSignedFlag(&compound)
-            let sig = Self.computeSignature(packet: compound, key: key)
+            let sig = computeSignature(packet: compound, key: key)
             compound.replaceSubrange(48..<64, with: sig.prefix(16))
         }
 
-        try await transport.send(compound)
-        let response = try await transport.receive()
+        let wireOut: Data
+        if encryptionEnabled && !encryptionKey.isEmpty {
+            wireOut = try SMB2TransformBuilder.buildGCM(
+                plaintext:     compound,
+                encryptionKey: encryptionKey,
+                sessionId:     sessionId
+            )
+        } else {
+            wireOut = compound
+        }
+
+        try await transport.send(wireOut)
+        var response = try await transport.receive()
+
+        if SMB2TransformParser.isTransformPacket(response) {
+            guard !decryptionKey.isEmpty else {
+                throw SMBError.signatureVerificationFailed
+            }
+            let parsed = try SMB2TransformParser.parse(response)
+            response = try SMB2TransformParser.decryptGCM(
+                parsed,
+                decryptionKey: decryptionKey
+            )
+        }
 
         let responses = SMBCompoundBuilder.parseResponses(response)
 
@@ -532,24 +671,75 @@ public actor SMBSession {
             Self.setSignedFlag(&packet)
             // Compute HMAC-SHA256 over the whole packet (signature field
             // zeroed) and write the first 16 bytes into the signature field.
-            let sig = Self.computeSignature(packet: packet, key: key)
+            let sig = computeSignature(packet: packet, key: key)
             packet.replaceSubrange(48..<64, with: sig.prefix(16))
         }
 
-        try await transport.send(packet)
-        let response = try await transport.receive()
+        // Update the preauth integrity hash BEFORE sending (required by
+        // [MS-SMB2] §3.2.5.3.1 for 3.1.1). Covers NEGOTIATE and every
+        // SESSION_SETUP request/response exchanged during the handshake.
+        if preauthActive,
+           command == SMB2Command.negotiate || command == SMB2Command.sessionSetup {
+            preauthIntegrityHash = sha512(preauthIntegrityHash + packet)
+        }
+
+        // ── Encrypt outgoing packet if encryption is enabled ───────────
+        // Wrapping happens AFTER signing — the plaintext still carries
+        // its HMAC/CMAC tag, and the transform header provides an outer
+        // AEAD tag over the whole envelope.
+        let wireOut: Data
+        if encryptionEnabled && !encryptionKey.isEmpty {
+            wireOut = try SMB2TransformBuilder.buildGCM(
+                plaintext:     packet,
+                encryptionKey: encryptionKey,
+                sessionId:     sessionId
+            )
+        } else {
+            wireOut = packet
+        }
+
+        try await transport.send(wireOut)
+        var response = try await transport.receive()
+
+        // ── Decrypt inbound transform-wrapped packet ───────────────────
+        // Some servers always encrypt responses once encryption is on;
+        // others only encrypt when the client did. Detect by protocol id.
+        if SMB2TransformParser.isTransformPacket(response) {
+            guard !decryptionKey.isEmpty else {
+                throw SMBError.signatureVerificationFailed
+            }
+            let parsed = try SMB2TransformParser.parse(response)
+            response = try SMB2TransformParser.decryptGCM(
+                parsed,
+                decryptionKey: decryptionKey
+            )
+        }
 
         guard response.count >= smb2HeaderSize else {
             throw SMBError.truncatedPacket
         }
         let respHeader = try SMB2Header.parse(response)
 
+        // Preauth hash update for the inbound response.
+        // NEGOTIATE response is always mixed in. SESSION_SETUP responses
+        // are mixed in UNTIL the final round (STATUS_SUCCESS) — the
+        // signing key is derived from the hash state just before the
+        // final success response, not after it. [MS-SMB2] §3.2.5.3.1.
+        if preauthActive {
+            if command == SMB2Command.negotiate {
+                preauthIntegrityHash = sha512(preauthIntegrityHash + response)
+            } else if command == SMB2Command.sessionSetup,
+                      !respHeader.isSuccess {
+                preauthIntegrityHash = sha512(preauthIntegrityHash + response)
+            }
+        }
+
         // ── Verify response signature if signing is active ─────────────
         if signingKey != nil && respHeader.flags & SMB2Flags.signed != 0 {
             var mutable = response
             // Zero out the signature field for verification.
             mutable.replaceSubrange(48..<64, with: Data(count: 16))
-            let expected = Self.computeSignature(packet: mutable, key: signingKey!)
+            let expected = computeSignature(packet: mutable, key: signingKey!)
             if expected.prefix(16) != respHeader.signature {
                 throw SMBError.signatureVerificationFailed
             }
@@ -590,12 +780,23 @@ public actor SMBSession {
         packet[packet.startIndex + 19] = UInt8((flags >> 24) & 0xFF)
     }
 
-    /// Compute HMAC-SHA256 over the given packet bytes using the signing key.
+    /// Compute the SMB2 signature over the packet bytes. Algorithm is
+    /// dialect-dependent per [MS-SMB2] §3.1.4.1:
+    ///   * SMB 2.x  — HMAC-SHA256
+    ///   * SMB 3.x  — AES-CMAC-128
     /// The Signature field in the packet should be zeroed before calling.
-    /// Returns the full 32-byte HMAC; caller takes prefix(16).
-    private static func computeSignature(packet: Data, key: SymmetricKey) -> Data {
-        let mac = HMAC<SHA256>.authenticationCode(for: packet, using: key)
-        return Data(mac)
+    /// Returns at least 16 bytes; caller takes `prefix(16)`.
+    private func computeSignature(packet: Data, key: SymmetricKey) -> Data {
+        let dialect = negotiated?.dialect ?? SMB2Dialect.smb202
+        switch dialect {
+        case SMB2Dialect.smb300, SMB2Dialect.smb302, SMB2Dialect.smb311:
+            // AES-CMAC-128 needs the raw 16-byte key bytes.
+            let keyBytes = key.withUnsafeBytes { Data($0) }
+            return aesCMAC(key: keyBytes, data: packet)
+        default:
+            let mac = HMAC<SHA256>.authenticationCode(for: packet, using: key)
+            return Data(mac)
+        }
     }
 }
 
@@ -613,5 +814,7 @@ extension SMBSession {
         public let serverGuid:      Data
         public let securityBuffer:  Data
         public let securityMode:    UInt16
+        /// Cipher selected by the server (3.1.1 only); 0 if none.
+        public let chosenCipher:    UInt16
     }
 }
