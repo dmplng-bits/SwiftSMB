@@ -82,17 +82,18 @@ public actor SMBStreamingProxy {
 
         // Start the listener and wait for `.ready` so we can read the port.
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            var resumed = false
+            // ResumeOnce lets us safely gate resumption from a Sendable closure.
+            let gate = ResumeOnce()
             listener.stateUpdateHandler = { state in
                 switch state {
                 case .ready:
-                    guard !resumed else { return }
-                    resumed = true
-                    continuation.resume(returning: ())
+                    if gate.fire() {
+                        continuation.resume(returning: ())
+                    }
                 case .failed(let err):
-                    guard !resumed else { return }
-                    resumed = true
-                    continuation.resume(throwing: SMBError.connectionFailed("proxy ready: \(err.localizedDescription)"))
+                    if gate.fire() {
+                        continuation.resume(throwing: SMBError.connectionFailed("proxy ready: \(err.localizedDescription)"))
+                    }
                 default:
                     break
                 }

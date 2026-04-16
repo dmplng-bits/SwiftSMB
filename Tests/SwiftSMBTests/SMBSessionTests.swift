@@ -66,7 +66,9 @@ final class SMBSessionTests: XCTestCase {
             maxWriteSize:    1 << 20,
             maxTransactSize: 1 << 20,
             serverGuid:      Data(repeating: 0xAB, count: 16),
-            securityBuffer:  Data([0xDE, 0xAD, 0xBE, 0xEF])
+            securityBuffer:  Data([0xDE, 0xAD, 0xBE, 0xEF]),
+            securityMode:    SMB2SecurityMode.signingEnabled,
+            chosenCipher:    SMB2Cipher.aes128gcm
         )
         XCTAssertEqual(info.dialect, SMB2Dialect.smb302)
         XCTAssertEqual(info.maxReadSize, 1_048_576)
@@ -74,6 +76,8 @@ final class SMBSessionTests: XCTestCase {
         XCTAssertEqual(info.maxTransactSize, 1_048_576)
         XCTAssertEqual(info.serverGuid.count, 16)
         XCTAssertEqual(info.securityBuffer, Data([0xDE, 0xAD, 0xBE, 0xEF]))
+        XCTAssertEqual(info.securityMode, SMB2SecurityMode.signingEnabled)
+        XCTAssertEqual(info.chosenCipher, SMB2Cipher.aes128gcm)
     }
 
     // MARK: - Error paths

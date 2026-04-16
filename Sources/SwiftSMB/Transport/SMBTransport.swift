@@ -82,8 +82,13 @@ public actor SMBTransport {
         self.timeouts = timeouts
     }
 
-    public convenience init(host: String, port: UInt16 = 445) {
-        self.init(endpoint: Endpoint(host: host, port: port))
+    // In Swift 6 actor inits cannot be marked `convenience`, and they
+    // also cannot delegate via `self.init(...)` (that pattern implicitly
+    // requires `convenience`). This secondary init sets the stored
+    // properties directly instead.
+    public init(host: String, port: UInt16 = 445) {
+        self.endpoint = Endpoint(host: host, port: port)
+        self.timeouts = Timeouts()
     }
 
     /// Host this transport connects to. Used by upper layers when they
@@ -156,9 +161,15 @@ public actor SMBTransport {
             throw SMBError.connectionFailed("Outbound message too large: \(message.count) bytes")
         }
 
-        var framed = Data(capacity: message.count + 4)
-        framed.append(contentsOf: Self.encodeLength(UInt32(message.count)))
-        framed.append(message)
+        // Build the framed packet as an immutable `let` so it can be
+        // captured by the @Sendable closure below without a Swift 6
+        // captured-var warning.
+        let framed: Data = {
+            var f = Data(capacity: message.count + 4)
+            f.append(contentsOf: Self.encodeLength(UInt32(message.count)))
+            f.append(message)
+            return f
+        }()
 
         try await withTimeout(seconds: timeouts.send, error: .timeout) {
             try await self.rawSend(conn, data: framed)
@@ -215,11 +226,12 @@ public actor SMBTransport {
 
     private func waitForReady(_ conn: NWConnection) async throws {
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            var hasResumed = false
+            // ResumeOnce lets us safely gate resumption from a Sendable closure.
+            let gate = ResumeOnce()
             let resume: (Result<Void, Error>) -> Void = { result in
-                guard !hasResumed else { return }
-                hasResumed = true
-                continuation.resume(with: result)
+                if gate.fire() {
+                    continuation.resume(with: result)
+                }
             }
 
             conn.stateUpdateHandler = { state in

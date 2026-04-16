@@ -100,7 +100,14 @@ public enum SMBShareEnumerator {
         session: SMBSession,
         serverName: String? = nil
     ) async throws -> [SMBShareInfo] {
-        let resolvedName = serverName ?? (await session.currentHost)
+        // `??` takes its RHS as a non-async @autoclosure, so we can't fold
+        // `await session.currentHost` into it. Resolve the name explicitly.
+        let resolvedName: String
+        if let explicit = serverName {
+            resolvedName = explicit
+        } else {
+            resolvedName = await session.currentHost
+        }
         // Open the srvsvc named pipe.
         let pipeBody = SMB2CreateRequest.build(
             path: "srvsvc",
@@ -403,11 +410,15 @@ public enum SMBShareEnumerator {
 
         var shares: [SMBShareInfo] = []
         for entry in rawEntries {
+            // In NDR a referent id of 0 means NULL — the string body is
+            // simply omitted from the wire. Reading unconditionally would
+            // consume 12 bytes of something else and desync the buffer.
+            // [MS-SRVS] allows NULL for both NetName and Remark, so guard.
             let name:    String
             let comment: String
             do {
-                name    = try readNDRString()
-                comment = try readNDRString()
+                name    = entry.nameRef    != 0 ? try readNDRString() : ""
+                comment = entry.commentRef != 0 ? try readNDRString() : ""
             } catch {
                 // If we can't parse the remaining strings, return what we have.
                 break

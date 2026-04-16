@@ -74,7 +74,10 @@ public enum SMB2LeaseContext {
             let nameOff = Int(r.uint16le(at: offset + 4))
             let nameLen = Int(r.uint16le(at: offset + 6))
             let dataOff = Int(r.uint16le(at: offset + 10))
-            let dataLen = Int(r.uint32le(at: offset + 12))
+            // DataLength at offset +12 is unused here — we just need the
+            // offset to reach the lease state. Leaving the read in as an
+            // explicit `_ =` keeps the wire-format comment accurate.
+            _ = r.uint32le(at: offset + 12)
 
             // Read name
             let absNameOff = offset + nameOff

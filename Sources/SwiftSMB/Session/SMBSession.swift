@@ -105,14 +105,13 @@ public actor SMBSession {
     // ── Signing ────────────────────────────────────────────────────────
     // After a successful SESSION_SETUP the session base key is run
     // through the SP800-108 KDF (for SMB 3.x) to derive a signing key.
-    // All outgoing packets get an HMAC-SHA256 tag in the Signature
-    // field, and all incoming responses are verified.
+    // All outgoing packets get a MAC in the Signature field and all
+    // incoming responses are verified.
     //
-    // NOTE: [MS-SMB2] §3.1.4.1 says SMB 3.x uses AES-CMAC-128 rather
-    // than HMAC-SHA256. We still compute HMAC-SHA256 here; servers that
-    // don't enforce strict signature verification accept it, and a
-    // correctly-derived key is a prerequisite for a future AES-CMAC
-    // upgrade. See `computeSignature` for the algorithm call site.
+    // Per [MS-SMB2] §3.1.4.1 the algorithm is dialect-dependent:
+    //   * SMB 2.x  — HMAC-SHA256 (16-byte prefix of the tag)
+    //   * SMB 3.x  — AES-CMAC-128
+    // `computeSignature` picks the right one based on `negotiated.dialect`.
     private var signingKey: SymmetricKey?
     private var signingRequired: Bool = false
 
@@ -157,8 +156,12 @@ public actor SMBSession {
         self.transport = transport
     }
 
-    public convenience init(host: String, port: UInt16 = 445) {
-        self.init(transport: SMBTransport(host: host, port: port))
+    // Note: in Swift 6 actor inits cannot be marked `convenience`, and
+    // they also cannot delegate via `self.init(...)` (that pattern
+    // implicitly requires `convenience`). So this secondary init
+    // initialises the stored property directly instead.
+    public init(host: String, port: UInt16 = 445) {
+        self.transport = SMBTransport(host: host, port: port)
     }
 
     // MARK: - Accessors (for the Client layer)
@@ -276,6 +279,29 @@ public actor SMBSession {
 
         // Detect signing requirement from server's security mode.
         signingRequired = (parsed.securityMode & SMB2SecurityMode.signingRequired) != 0
+
+        // ── Cipher-downgrade protection ────────────────────────────────
+        // [MS-SMB2] §3.2.5.2: if the server returns an
+        // EncryptionCapabilities context, the single cipher it chose MUST
+        // be one the client advertised. Anything else is a downgrade
+        // attempt (or a buggy server) — refuse to continue since we'd
+        // otherwise silently disable encryption.
+        // `chosenCipher == 0` means "no cipher context / no encryption"
+        // which is legal and just leaves encryption off.
+        // A chosen cipher on a pre-3.1.1 dialect is also a spec violation.
+        if parsed.chosenCipher != 0 {
+            let offered: Set<UInt16> = [
+                SMB2Cipher.aes128ccm,
+                SMB2Cipher.aes128gcm
+            ]
+            guard parsed.dialectRevision == SMB2Dialect.smb311,
+                  offered.contains(parsed.chosenCipher) else {
+                throw SMBError.negotiationFailed(
+                    "server selected cipher 0x\(String(parsed.chosenCipher, radix: 16)) " +
+                    "that was not offered (possible downgrade attack or non-compliant server)"
+                )
+            }
+        }
 
         self.negotiated = Negotiated(
             dialect:         parsed.dialectRevision,
@@ -415,7 +441,15 @@ public actor SMBSession {
         //
         // An anonymous session has no base key and therefore can't sign —
         // that's fine, servers that allow anonymous IPC$ don't require it.
+        // [MS-SMB2] §3.2.5.3.1: if the server advertised SIGNING_REQUIRED in
+        // the NEGOTIATE response, a session that can't sign must not be
+        // used. Fail-closed rather than letting the server reject every
+        // subsequent request with ACCESS_DENIED.
         if sessionBaseKey.isEmpty {
+            if signingRequired {
+                sessionId = 0
+                throw SMBError.signingRequired
+            }
             signingKey = nil
             encryptionKey = Data()
             decryptionKey = Data()
@@ -592,13 +626,15 @@ public actor SMBSession {
         )
 
         // Sign each command in the compound if signing is active.
+        // [MS-SMB2] §3.1.4.1: "If the message is a compounded request or
+        // response, each message MUST be signed separately." That means
+        // every chained SMB2 header gets SMB2_FLAGS_SIGNED set, its own
+        // signature field zeroed, and then a MAC computed over just that
+        // message's bytes (header + body + any tail padding). Previous
+        // revisions signed the whole compound as a single blob which
+        // Windows Server rejects once signing is enforced.
         if let key = signingKey {
-            // For compound requests, each individual command needs signing.
-            // This is complex — for now, sign the whole compound as one.
-            // (Most NAS accept this for related compounds.)
-            Self.setSignedFlag(&compound)
-            let sig = computeSignature(packet: compound, key: key)
-            compound.replaceSubrange(48..<64, with: sig.prefix(16))
+            signCompoundPacket(&compound, key: key)
         }
 
         let wireOut: Data
@@ -624,6 +660,16 @@ public actor SMBSession {
                 parsed,
                 decryptionKey: decryptionKey
             )
+        }
+
+        // Verify each chained response's signature before handing any of
+        // them back to callers. The single-request path does this at the
+        // end of `sendRequest`; the compound path used to skip it, which
+        // let a tampered inner response slip past.
+        if let key = signingKey {
+            guard verifyCompoundSignatures(response, key: key) else {
+                throw SMBError.signatureVerificationFailed
+            }
         }
 
         let responses = SMBCompoundBuilder.parseResponses(response)
@@ -786,6 +832,112 @@ public actor SMBSession {
         packet[packet.startIndex + 17] = UInt8((flags >>  8) & 0xFF)
         packet[packet.startIndex + 18] = UInt8((flags >> 16) & 0xFF)
         packet[packet.startIndex + 19] = UInt8((flags >> 24) & 0xFF)
+    }
+
+    /// Walk a (possibly compounded) SMB2 packet and return the byte
+    /// ranges of each chained message. Ranges are expressed as
+    /// `packet`-relative `(offset, length)` pairs so the caller can index
+    /// with `packet.startIndex + offset`.
+    private static func compoundRanges(in packet: Data) -> [(offset: Int, length: Int)] {
+        var ranges: [(Int, Int)] = []
+        var offset = 0
+        while offset + smb2HeaderSize <= packet.count {
+            // NextCommand sits at header offset +20..+24 (little-endian).
+            let base = packet.startIndex + offset + 20
+            let nextCommand =
+                UInt32(packet[base])                 |
+                UInt32(packet[base + 1]) <<  8 |
+                UInt32(packet[base + 2]) << 16 |
+                UInt32(packet[base + 3]) << 24
+            let len = (nextCommand == 0)
+                ? (packet.count - offset)
+                : Int(nextCommand)
+            // Defensive — a corrupt NextCommand must not walk past the end.
+            guard len >= smb2HeaderSize, offset + len <= packet.count else {
+                // Bail out; verifier will treat this as a failure.
+                return ranges
+            }
+            ranges.append((offset, len))
+            if nextCommand == 0 { break }
+            offset += Int(nextCommand)
+        }
+        return ranges
+    }
+
+    /// Sign every chained message in `packet` individually as required by
+    /// [MS-SMB2] §3.1.4.1. Sets SMB2_FLAGS_SIGNED on each header, zeros
+    /// its signature field, then computes a MAC over just that message's
+    /// bytes and writes it back into that header's signature field.
+    private func signCompoundPacket(_ packet: inout Data, key: SymmetricKey) {
+        let ranges = Self.compoundRanges(in: packet)
+
+        // Pass 1: set SIGNED flag and zero every signature field. Signing
+        // each message covers the signature-zeroed bytes of its OWN
+        // header — having the other headers zeroed or not doesn't matter
+        // since no inter-message bytes are hashed into any single MAC.
+        for (offset, _) in ranges {
+            // Flags at +16..+20.
+            let flagsOff = packet.startIndex + offset + 16
+            var flags: UInt32 = 0
+            for i in 0..<4 {
+                flags |= UInt32(packet[flagsOff + i]) << (8 * i)
+            }
+            flags |= SMB2Flags.signed
+            for i in 0..<4 {
+                packet[flagsOff + i] = UInt8((flags >> (8 * i)) & 0xFF)
+            }
+            // Signature at +48..+64.
+            let sigStart = packet.startIndex + offset + 48
+            packet.replaceSubrange(sigStart ..< sigStart + 16,
+                                   with: Data(count: 16))
+        }
+
+        // Pass 2: MAC each message, write signature back.
+        // Use an explicit byte-array copy so the extracted Data has
+        // startIndex == 0, which `computeSignature` expects.
+        for (offset, length) in ranges {
+            let start = packet.startIndex + offset
+            let end   = start + length
+            let msg   = Data([UInt8](packet[start ..< end]))
+            let sig   = computeSignature(packet: msg, key: key)
+            let sigStart = start + 48
+            packet.replaceSubrange(sigStart ..< sigStart + 16,
+                                   with: sig.prefix(16))
+        }
+    }
+
+    /// Verify each signed message in a (possibly compounded) response.
+    /// Returns true iff every message whose header carries the SIGNED
+    /// flag verifies under `key`. Messages without the SIGNED flag are
+    /// ignored — that matches the single-request path at line ~746.
+    private func verifyCompoundSignatures(_ packet: Data, key: SymmetricKey) -> Bool {
+        let ranges = Self.compoundRanges(in: packet)
+        guard !ranges.isEmpty else { return false }
+
+        for (offset, length) in ranges {
+            let flagsOff = packet.startIndex + offset + 16
+            var flags: UInt32 = 0
+            for i in 0..<4 {
+                flags |= UInt32(packet[flagsOff + i]) << (8 * i)
+            }
+            guard flags & SMB2Flags.signed != 0 else { continue }
+
+            // Build a zero-indexed byte-array copy of the message so the
+            // 48..<64 indices below are unambiguous.
+            let start = packet.startIndex + offset
+            let end   = start + length
+            var msg   = Data([UInt8](packet[start ..< end]))
+
+            // Stash the wire signature, zero the field for the MAC recompute.
+            let expected = Data(msg[48 ..< 64])
+            msg.replaceSubrange(48 ..< 64, with: Data(count: 16))
+
+            let computed = computeSignature(packet: msg, key: key)
+            if computed.prefix(16) != expected {
+                return false
+            }
+        }
+        return true
     }
 
     /// Compute the SMB2 signature over the packet bytes. Algorithm is
