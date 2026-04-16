@@ -58,8 +58,14 @@ public enum NTLMv2 {
 
     /// NTLMv2 Hash: HMAC-MD5(ntHash, UTF-16LE(UPPER(user) + domain)).
     /// The `domain` should be the NetBIOS domain or target name.
+    ///
+    /// Use a locale-independent uppercase — `String.uppercased()` without
+    /// a locale argument uses the user's current locale, which on Turkish
+    /// systems maps "i" → "İ" (U+0130) and breaks auth against servers
+    /// that uppercase with en_US_POSIX.
     public static func ntlmv2Hash(ntHash: Data, user: String, domain: String) -> Data {
-        let identity = (user.uppercased() + domain).utf16leData
+        let upperUser = user.uppercased(with: Locale(identifier: "en_US_POSIX"))
+        let identity = (upperUser + domain).utf16leData
         return hmacMD5(key: ntHash, data: identity)
     }
 
@@ -165,7 +171,28 @@ public enum NTLMv2 {
         // WorkstationFields (offset/length = 0)
         w.zeros(8)
 
+        // Version (8 bytes) — required by [MS-NLMP] §2.2.1.1 when we
+        // advertise NTLMSSP_NEGOTIATE_VERSION (we always do). Strict
+        // servers (modern Samba) parse this field unconditionally based
+        // on the negotiate-version flag, so omitting it shifts every
+        // subsequent payload offset by 8 bytes and desyncs the server.
+        w.bytes(ntlmVersionStruct())
+
         return w.data
+    }
+
+    /// Standard NTLM VERSION structure ([MS-NLMP] §2.2.2.10).
+    /// We claim Windows 10 build 19041, NTLM revision 15 — matching what
+    /// impacket and modern Windows ship. Servers only look at the
+    /// revision byte.
+    private static func ntlmVersionStruct() -> Data {
+        var v = ByteWriter()
+        v.uint8(10)       // ProductMajorVersion
+        v.uint8(0)        // ProductMinorVersion
+        v.uint16le(19041) // ProductBuild
+        v.zeros(3)        // Reserved (must be zero)
+        v.uint8(15)       // NTLMRevisionCurrent = 0x0F (NTLMSSP_REVISION_W2K3)
+        return v.data
     }
 
     /// Parse a Type 2 (CHALLENGE) message from the server.
@@ -242,7 +269,12 @@ public enum NTLMv2 {
         let lmResponse = Data([0x00])
         let ntResponse = Data()
 
-        let headerSize = 88
+        // Fixed header layout ([MS-NLMP] §2.2.1.3):
+        //   Signature(8) + MessageType(4) + 6×SecurityBufferFields(8)
+        //   + NegotiateFlags(4) + Version(8) = 72 bytes
+        // We always include Version because we always set
+        // NTLMSSP_NEGOTIATE_VERSION. No MIC — see note in `authenticate`.
+        let headerSize = 72
         var offset = headerSize
 
         func advance(_ count: Int) -> (offset: UInt32, length: UInt16) {
@@ -259,7 +291,7 @@ public enum NTLMv2 {
         let skField     = advance(0)
 
         // Strip the KEY_EXCH bit (no session key to exchange) and add
-        // the ANONYMOUS marker.
+        // the ANONYMOUS marker. Keep VERSION since we write the struct.
         let flags = (challengeFlags & ~Flag.keyExch) | Flag.anonymous
 
         var w = ByteWriter()
@@ -278,6 +310,11 @@ public enum NTLMv2 {
         writeBuf(wsField)
         writeBuf(skField)
         w.uint32le(flags)
+        // Version — must be present because NTLMSSP_NEGOTIATE_VERSION
+        // is still set in `flags` above. Without this, every payload
+        // offset we computed would be 8 bytes too high → garbage reads
+        // on the server → STATUS_INVALID_PARAMETER.
+        w.bytes(ntlmVersionStruct())
 
         w.bytes(lmResponse)
         w.bytes(ntResponse)
@@ -302,9 +339,36 @@ public enum NTLMv2 {
         let wsBytes     = workstation.utf16leData
         let lmResponse  = Data(count: 24)  // empty LM response (NTLMv2 doesn't use it)
 
-        // The payload starts right after the fixed header.
-        // Fixed header = 8 (sig) + 4 (type) + 6*8 (six SecurityBuffer fields) + 4 (flags) = 88 bytes
-        let headerSize = 88
+        // If we're not providing an EncryptedRandomSessionKey, we MUST
+        // clear the KEY_EXCH flag — otherwise modern Samba parses an
+        // empty key-exchange field and returns STATUS_INVALID_PARAMETER.
+        // Server-supported key exchange would require we RC4-encrypt a
+        // random session key with KeyExchangeKey; we don't implement
+        // that yet, so just tell the server not to expect one.
+        let sessionKeyData = sessionBaseKey ?? Data()
+        let adjustedFlags = sessionKeyData.isEmpty
+            ? (flags & ~Flag.keyExch)
+            : flags
+
+        // Fixed header layout ([MS-NLMP] §2.2.1.3):
+        //   Signature(8) + MessageType(4) + 6×SecurityBufferFields(8)
+        //   + NegotiateFlags(4) + Version(8) = 72 bytes
+        //
+        // Version is required whenever NTLMSSP_NEGOTIATE_VERSION is set
+        // in `flags`. We always set it in the Type-1 message so the
+        // server typically keeps it in the challenge and expects it
+        // back here. The previous code claimed headerSize = 88 but only
+        // actually wrote 64 bytes of header, so every payload offset in
+        // the security-buffer descriptors pointed 24 bytes past where
+        // the bytes actually were — which is the root cause of the
+        // STATUS_INVALID_PARAMETER we were seeing from Samba.
+        //
+        // MIC is NOT included here. [MS-NLMP] §3.1.5.1.2 says the
+        // client MUST compute MIC only if the server's CHALLENGE
+        // TargetInfo AV_PAIR list contained MsvAvFlags with the MIC
+        // bit set. We'd rather omit it and accept a slightly weaker
+        // handshake than send an incorrect MIC.
+        let headerSize = 72
         var offset = headerSize
 
         func advance(_ count: Int) -> (offset: UInt32, length: UInt16) {
@@ -318,7 +382,6 @@ public enum NTLMv2 {
         let domainField = advance(domainBytes.count)
         let userField   = advance(userBytes.count)
         let wsField     = advance(wsBytes.count)
-        let sessionKeyData = sessionBaseKey ?? Data()
         let skField     = advance(sessionKeyData.count)
 
         var w = ByteWriter()
@@ -338,7 +401,10 @@ public enum NTLMv2 {
         writeBuf(userField)     // UserNameFields
         writeBuf(wsField)       // WorkstationFields
         writeBuf(skField)       // EncryptedRandomSessionKeyFields
-        w.uint32le(flags)       // NegotiateFlags
+        w.uint32le(adjustedFlags) // NegotiateFlags
+        // Version (8 bytes) — required because NTLMSSP_NEGOTIATE_VERSION
+        // is set. See comment on headerSize above.
+        w.bytes(ntlmVersionStruct())
 
         // Payload
         w.bytes(lmResponse)
