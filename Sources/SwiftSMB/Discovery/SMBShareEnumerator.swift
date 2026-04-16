@@ -210,7 +210,8 @@ public enum SMBShareEnumerator {
     // MARK: - DCE/RPC Bind
 
     /// Build a minimal DCE/RPC Bind PDU for the SrvSvc interface.
-    private static func buildRPCBind() -> Data {
+    /// `internal` (not `private`) so tests can exercise the wire format.
+    internal static func buildRPCBind() -> Data {
         var w = ByteWriter()
         // RPC Header (common fields)
         w.uint8(5)             // rpc_vers (5)
@@ -263,7 +264,8 @@ public enum SMBShareEnumerator {
     /// `serverName` is sent as the NDR `ServerName` parameter wrapped in
     /// `\\HOST` form — strict Samba rejects an empty server name with
     /// STATUS_INVALID_PARAMETER, and Windows happily accepts the UNC.
-    private static func buildNetShareEnumAll(serverName: String) -> Data {
+    /// `internal` (not `private`) so tests can exercise the wire format.
+    internal static func buildNetShareEnumAll(serverName: String) -> Data {
         var w = ByteWriter()
         // RPC Header
         w.uint8(5)             // rpc_vers
