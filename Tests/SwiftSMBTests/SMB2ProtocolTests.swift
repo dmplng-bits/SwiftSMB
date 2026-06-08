@@ -219,6 +219,39 @@ final class SMB2ProtocolTests: XCTestCase {
         XCTAssertTrue(createOptions & SMB2CreateOptions.nonDirectoryFile != 0)
     }
 
+    /// [MS-SMB2] §2.2.13: When the file name is empty (share root) and no
+    /// create contexts are present, the Buffer MUST be a single zero byte.
+    /// StructureSize = 57 = 56 fixed + 1 mandatory Buffer byte.
+    /// Regression test for STATUS_INVALID_PARAMETER on strict Samba servers.
+    func testCreateRootDirectoryEmitsMandatoryBufferByte() {
+        let body = SMB2CreateRequest.openDirectory(path: "")
+
+        // Body must be exactly 57 bytes (56 fixed + 1 Buffer byte)
+        XCTAssertEqual(body.count, 57,
+                       "empty-name CREATE must include the mandatory 1-byte Buffer")
+
+        // StructureSize field (offset 0..1) still declares 57
+        let structureSize = UInt16(body[0]) | UInt16(body[1]) << 8
+        XCTAssertEqual(structureSize, 57)
+
+        // NameLength field (offset 46..47) is 0 for the share root
+        let nameLength = UInt16(body[46]) | UInt16(body[47]) << 8
+        XCTAssertEqual(nameLength, 0, "NameLength must be 0 for share root")
+
+        // The trailing Buffer byte is the mandatory zero
+        XCTAssertEqual(body[body.count - 1], 0,
+                       "Trailing Buffer byte must be 0x00")
+    }
+
+    /// Non-empty paths must NOT get an extra padding byte.
+    func testCreateNamedPathNoExtraByte() {
+        let body = SMB2CreateRequest.openDirectory(path: "Photos")
+        let pathData = "Photos".utf16leData
+
+        // 56 fixed bytes + path length, no trailing padding
+        XCTAssertEqual(body.count, 56 + pathData.count)
+    }
+
     func testCreateResponseParse() throws {
         let body = buildSyntheticCreateResponse()
         let resp = try SMB2CreateResponse.parse(body)

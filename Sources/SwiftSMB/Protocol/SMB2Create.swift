@@ -89,6 +89,15 @@ public enum SMB2CreateRequest {
         w.uint32le(0)                           // CreateContextsOffset (0 = none)
         w.uint32le(0)                           // CreateContextsLength (0 = none)
         w.bytes(pathData)                       // Buffer (UTF-16LE path)
+        // [MS-SMB2] §2.2.13: StructureSize is fixed at 57 (= 56 fixed bytes
+        // + a mandatory ≥1-byte variable Buffer). When the name is empty
+        // (opening the share root) and there are no create contexts, the
+        // Buffer MUST still contain a single zero byte. Omitting it sends a
+        // 56-byte body whose length contradicts StructureSize; spec-strict
+        // servers reject this with STATUS_INVALID_PARAMETER (0xC000000D).
+        if pathData.isEmpty {
+            w.uint8(0)
+        }
         return w.data
     }
 
