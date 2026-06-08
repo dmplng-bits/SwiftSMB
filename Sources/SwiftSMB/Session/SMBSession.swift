@@ -793,26 +793,47 @@ public actor SMBSession {
         }
 
         try await transport.send(wireOut)
-        var response = try await transport.receive()
 
-        // ── Decrypt inbound transform-wrapped packet ───────────────────
-        // Some servers always encrypt responses once encryption is on;
-        // others only encrypt when the client did. Detect by protocol id.
-        if SMB2TransformParser.isTransformPacket(response) {
-            guard !decryptionKey.isEmpty else {
-                throw SMBError.signatureVerificationFailed
+        // Read the response, transparently skipping SMB2 async INTERIM
+        // responses. Per [MS-SMB2] §3.2.5.1.5, when a server can't satisfy a
+        // request immediately (common for READ on large files, or any op on a
+        // busy NAS) it first sends an INTERIM response with Status =
+        // STATUS_PENDING (0x00000103) and the SMB2_FLAGS_ASYNC_COMMAND flag
+        // set, then sends the FINAL response later on the same connection.
+        // The interim packet is NOT the result — if we returned it, the real
+        // response would be left unread and the NEXT request would read it,
+        // desyncing the whole stream (observed as STATUS_PENDING reads followed
+        // by cascading "unexpected command" errors). Loop until the final,
+        // non-interim response arrives.
+        var response: Data
+        var respHeader: SMB2Header
+        var interimGuard = 0
+        repeat {
+            response = try await transport.receive()
+
+            // ── Decrypt inbound transform-wrapped packet ───────────────────
+            // Some servers always encrypt responses once encryption is on;
+            // others only encrypt when the client did. Detect by protocol id.
+            if SMB2TransformParser.isTransformPacket(response) {
+                guard !decryptionKey.isEmpty else {
+                    throw SMBError.signatureVerificationFailed
+                }
+                let parsed = try SMB2TransformParser.parse(response)
+                response = try SMB2TransformParser.decryptGCM(
+                    parsed,
+                    decryptionKey: decryptionKey
+                )
             }
-            let parsed = try SMB2TransformParser.parse(response)
-            response = try SMB2TransformParser.decryptGCM(
-                parsed,
-                decryptionKey: decryptionKey
-            )
-        }
 
-        guard response.count >= smb2HeaderSize else {
-            throw SMBError.truncatedPacket
-        }
-        let respHeader = try SMB2Header.parse(response)
+            guard response.count >= smb2HeaderSize else {
+                throw SMBError.truncatedPacket
+            }
+            respHeader = try SMB2Header.parse(response)
+
+            interimGuard += 1
+            if interimGuard > 64 { break }   // safety valve against a stuck peer
+        } while respHeader.status == NTStatus.pending
+            && (respHeader.flags & SMB2Flags.asyncCommand) != 0
 
         // Preauth hash update for the inbound response.
         // NEGOTIATE response is always mixed in. SESSION_SETUP responses

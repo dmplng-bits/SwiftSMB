@@ -308,6 +308,9 @@ public enum SMB2LeaseState {
 
 public enum NTStatus {
     public static let success:                UInt32 = 0x0000_0000
+    /// Interim response for an async operation — NOT a final result.
+    /// [MS-SMB2] §2.2.1.2 / §3.2.5.1.5: the real response follows later.
+    public static let pending:                UInt32 = 0x0000_0103
     public static let moreProcessingRequired: UInt32 = 0xC000_0016
     public static let invalidParameter:       UInt32 = 0xC000_000D
     public static let noSuchFile:             UInt32 = 0xC000_000F
