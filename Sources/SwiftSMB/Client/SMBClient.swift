@@ -40,6 +40,14 @@ public actor SMBClient {
     /// itself doesn't use it, but `url(ofItem:)` does.
     private var streamingProxy: SMBStreamingProxy?
 
+    /// In-flight proxy-start task. Coalesces concurrent `url(ofItem:)` callers
+    /// onto a SINGLE proxy. Without this, the actor-reentrancy gap at
+    /// `await proxy.start()` lets N concurrent callers each create+start their
+    /// own proxy+listener; all but the last get deallocated, cancelling their
+    /// listeners, so the URLs they minted point at dead ports (→ connection
+    /// reset / NSURLError -1005 in AVPlayer).
+    private var proxyStartTask: Task<SMBStreamingProxy, Error>?
+
     // MARK: Init
 
     public init(session: SMBSession) {
@@ -464,16 +472,31 @@ public actor SMBClient {
     public func url(ofItem path: String) async throws -> URL {
         let normalized = Self.normalize(path)
 
-        if streamingProxy == nil {
+        let proxy = try await ensureStreamingProxy()
+        return try await proxy.url(forPath: normalized)
+    }
+
+    /// Returns the single shared streaming proxy, starting it exactly once even
+    /// under concurrent callers (coalesced via `proxyStartTask`).
+    private func ensureStreamingProxy() async throws -> SMBStreamingProxy {
+        if let proxy = streamingProxy { return proxy }
+        if let task = proxyStartTask { return try await task.value }
+
+        let task = Task { () throws -> SMBStreamingProxy in
             let proxy = SMBStreamingProxy(client: self)
             try await proxy.start()
+            return proxy
+        }
+        proxyStartTask = task
+        do {
+            let proxy = try await task.value
             streamingProxy = proxy
+            proxyStartTask = nil
+            return proxy
+        } catch {
+            proxyStartTask = nil
+            throw error
         }
-
-        guard let proxy = streamingProxy else {
-            throw SMBError.connectionFailed("Failed to start streaming proxy")
-        }
-        return try await proxy.url(forPath: normalized)
     }
 
     // MARK: - SMBFile convenience overloads

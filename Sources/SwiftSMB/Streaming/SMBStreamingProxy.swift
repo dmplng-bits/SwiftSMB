@@ -63,8 +63,13 @@ public actor SMBStreamingProxy {
         if isRunning { return }
 
         let params = NWParameters.tcp
-        params.requiredInterfaceType = .loopback
+        // NOTE: `requiredInterfaceType = .loopback` was removed. On the tvOS
+        // simulator the loopback interface isn't enumerated the same way as on
+        // device, so a listener that *requires* it binds to a port but never
+        // fires `newConnectionHandler` — AVPlayer's connection to 127.0.0.1 is
+        // reset (NSURLError -1005). `acceptLocalOnly` still keeps it local.
         params.acceptLocalOnly = true
+        params.allowLocalEndpointReuse = true
 
         let listener: NWListener
         do {
