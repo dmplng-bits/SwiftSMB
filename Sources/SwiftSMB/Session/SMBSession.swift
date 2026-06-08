@@ -95,6 +95,39 @@ public actor SMBSession {
     private var sessionId: UInt64 = 0
     private var treeId:    UInt32 = 0
 
+    // ── Request serialization ──────────────────────────────────────────
+    // Responses are read inline in `sendRequest` (there is no central
+    // per-messageId demultiplexing read loop). Because actors are REENTRANT
+    // across `await`, two overlapping `sendRequest` calls would each call
+    // `transport.receive()` on the same socket and steal each other's bytes,
+    // corrupting both responses (observed as failed READs that drop the
+    // streaming proxy connection → AVPlayer NSURLError -1005). This FIFO async
+    // mutex serializes the entire send→receive round-trip so exactly one
+    // request is in flight at a time.
+    private var ioBusy = false
+    private var ioWaiters: [CheckedContinuation<Void, Never>] = []
+
+    /// Acquire the round-trip mutex (FIFO). Suspends if a request is in flight.
+    private func ioAcquire() async {
+        if !ioBusy {
+            ioBusy = true
+            return
+        }
+        await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in
+            ioWaiters.append(c)
+        }
+    }
+
+    /// Release the round-trip mutex, handing off to the next waiter if any.
+    private func ioRelease() {
+        if ioWaiters.isEmpty {
+            ioBusy = false
+        } else {
+            // Hand the lock directly to the next waiter (ioBusy stays true).
+            ioWaiters.removeFirst().resume()
+        }
+    }
+
     private(set) public var negotiated: Negotiated?
 
     // ── Credit tracking ────────────────────────────────────────────────
@@ -695,6 +728,13 @@ public actor SMBSession {
         body: Data,
         payloadSize: Int = 0
     ) async throws -> (SMB2Header, Data) {
+        // Serialize the entire round-trip. messageId assignment, preauth-hash
+        // updates, signing, the send, and the inline response read must all
+        // complete for one request before the next begins — the actor alone
+        // does not guarantee this because it is reentrant across `await`.
+        await ioAcquire()
+        defer { ioRelease() }
+
         // Grab & advance the messageId atomically (we're an actor).
         let myMessageId = messageId
         let charge = Self.creditCharge(forPayloadLength: payloadSize)
