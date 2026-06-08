@@ -574,15 +574,49 @@ public actor SMBClient {
         return min(serverMax, 1 << 20)
     }
 
+    // ── File-handle serialization ──────────────────────────────────────
+    // Some servers (notably strict embedded/NAS SMB stacks) tolerate only ONE
+    // open file handle per session at a time — opening a second CREATE handle
+    // implicitly invalidates the first, so the next operation on it fails with
+    // STATUS_FILE_CLOSED (0xC0000128). Per-request serialization in SMBSession
+    // is not enough because open→work→close is a multi-request *sequence*. This
+    // FIFO async mutex makes the whole sequence atomic: one handle at a time.
+    private var fileOpBusy = false
+    private var fileOpWaiters: [CheckedContinuation<Void, Never>] = []
+
+    private func fileOpAcquire() async {
+        if !fileOpBusy {
+            fileOpBusy = true
+            return
+        }
+        await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in
+            fileOpWaiters.append(c)
+        }
+    }
+
+    private func fileOpRelease() {
+        if fileOpWaiters.isEmpty {
+            fileOpBusy = false
+        } else {
+            fileOpWaiters.removeFirst().resume()
+        }
+    }
+
     /// Run `work` with a freshly-opened file handle and always CLOSE the
     /// handle before returning, even on error. Replaces the
     /// `defer { Task { ... } }` pattern that couldn't guarantee the close
     /// ran before the function returned.
+    ///
+    /// The entire open→work→close sequence is serialized (see `fileOpAcquire`)
+    /// so only one file handle is ever open at once.
     private func withFileHandle<T>(
         path: String,
         body: Data,
         _ work: (SMB2FileId) async throws -> T
     ) async throws -> T {
+        await fileOpAcquire()
+        defer { fileOpRelease() }
+
         let fileId = try await open(path: path, body: body)
         do {
             let result = try await work(fileId)
