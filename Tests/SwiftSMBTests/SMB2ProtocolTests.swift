@@ -359,6 +359,30 @@ final class SMB2ProtocolTests: XCTestCase {
         XCTAssertEqual(structureSize, 41)
     }
 
+    /// [MS-SMB2] §2.2.37: FileId MUST sit at offset 24 in the request body.
+    /// InputBufferOffset is 2 bytes (not 4) — writing it as uint32 pushed
+    /// the FileId to offset 26, causing STATUS_FILE_CLOSED on strict servers.
+    /// StructureSize 41 = 40 fixed + 1 mandatory Buffer byte.
+    func testQueryInfoFileIdAtOffset24() {
+        let fid = SMB2FileId(persistent: 0x1122334455667788,
+                             volatile:   0x99AABBCCDDEEFF00)
+        let body = SMB2QueryInfoRequest.build(
+            fileId: fid,
+            infoType: SMB2InfoType.file,
+            fileInfoClass: SMB2FileInformationClass.fileStandardInformation
+        )
+
+        // FileId MUST start at byte 24 of the request body.
+        var r = ByteReader(body)
+        try! r.skip(24)
+        XCTAssertEqual(try! r.uint64le(), 0x1122334455667788, "persistent FileId")
+        XCTAssertEqual(try! r.uint64le(), 0x99AABBCCDDEEFF00, "volatile FileId")
+
+        // StructureSize 41 = 40 fixed + 1 mandatory Buffer byte.
+        XCTAssertEqual(body.count, 41,
+                       "QUERY_INFO body must be 41 bytes (40 fixed + 1 Buffer)")
+    }
+
     func testFileStandardInfoParse() throws {
         // Build synthetic FILE_STANDARD_INFORMATION (24 bytes)
         var w = ByteWriter()

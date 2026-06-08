@@ -236,12 +236,20 @@ public enum SMB2QueryInfoRequest {
         w.uint8(infoType)                  // InfoType
         w.uint8(fileInfoClass)             // FileInfoClass
         w.uint32le(outputBufferLength)     // OutputBufferLength
-        w.uint32le(0)                      // InputBufferOffset (0 = none)
+        // [MS-SMB2] §2.2.37: InputBufferOffset is a 2-byte field followed by a
+        // 2-byte Reserved. Writing it as uint32 pushed every following field —
+        // crucially the FileId — 2 bytes too far, so the server read a corrupt
+        // FileId and replied STATUS_FILE_CLOSED (0xC0000128). FileId MUST sit at
+        // offset 24 from the start of this request body.
+        w.uint16le(0)                      // InputBufferOffset (2 bytes, 0 = none)
         w.zeros(2)                         // Reserved
         w.uint32le(0)                      // InputBufferLength (0 = none)
         w.uint32le(0)                      // AdditionalInformation
         w.uint32le(0)                      // Flags
-        fileId.write(to: &w)               // FileId (16 bytes)
+        fileId.write(to: &w)               // FileId (16 bytes) — offset 24
+        // [MS-SMB2] §2.2.37: StructureSize is fixed at 41 (= 40 fixed + a
+        // mandatory >=1-byte Buffer). With no input buffer it MUST be a single 0.
+        w.uint8(0)
         return w.data
     }
 }
