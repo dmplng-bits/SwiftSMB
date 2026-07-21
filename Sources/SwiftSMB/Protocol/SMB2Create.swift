@@ -19,7 +19,7 @@ import Foundation
 
 /// The 16-byte persistent + volatile file handle returned by CREATE.
 /// Used in READ, CLOSE, QUERY_DIRECTORY, QUERY_INFO, etc.
-public struct SMB2FileId: Equatable {
+public struct SMB2FileId: Equatable, Sendable {
     public let persistent: UInt64
     public let volatile:   UInt64
 

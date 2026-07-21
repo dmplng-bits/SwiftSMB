@@ -135,6 +135,79 @@ public actor SMBSession {
     // we spend them on each request. Large reads/writes cost more than 1.
     private var creditsAvailable: UInt16 = 0
 
+    // ── Pipelining (multiple requests in flight) ────────────────────────
+    // The serial path above allows exactly ONE request on the wire at a
+    // time. That caps throughput on a latency-bound link because every
+    // read/write pays a full round-trip back-to-back. The pipeline below
+    // lets many requests be outstanding at once: senders emit under a short
+    // wire lock and then suspend on a per-messageId continuation; a single
+    // background reader task owns `transport.receive()`, matches each reply
+    // to its request by MessageId, and resumes the right sender.
+    //
+    // Pipelining is only active AFTER the handshake (the handshake needs
+    // strict request/response ordering for the preauth-integrity hash and
+    // runs on the serial path with the reader stopped). Setting
+    // `maxInFlightRequests` to 1 disables pipelining entirely — the session
+    // then behaves exactly like the original serial implementation, which
+    // is the safe fallback if the pipeline ever misbehaves against a server.
+
+    /// Maximum SMB2 requests allowed on the wire at once. 1 = serial (no
+    /// pipeline). Applied to reads/writes as the read/write concurrency.
+    /// Read ONCE, at connect, into `activeConcurrency`/`pipeliningEnabled` —
+    /// mutating it on a live session has no effect until the next connect, so
+    /// the pipeline can never flip to serial mid-session (which would put two
+    /// readers on the socket).
+    public var maxInFlightRequests: Int = 8
+
+    /// Snapshot of `maxInFlightRequests` taken when the reader started. Governs
+    /// whether pipelining is active and the read/write fan-out width.
+    private var pipeliningEnabled = false
+    private var activeConcurrency = 1
+
+    /// True once `startReader()` has spun up the background reader.
+    private var readerRunning = false
+    private var readerTask: Task<Void, Never>?
+
+    /// Fatal pipeline error (transport died / desync). While set, pipelined
+    /// sends fail fast; cleared on reconnect.
+    private var pipelineDead: Error?
+
+    /// One outstanding request awaiting its reply.
+    private struct Pending {
+        let command: UInt16
+        let continuation: CheckedContinuation<(SMB2Header, Data), Error>
+    }
+    /// messageId → waiting sender.
+    private var pending: [UInt64: Pending] = [:]
+    /// Replies that arrived before the sender finished registering its
+    /// continuation (the reader can run between our send and our await).
+    private var earlyReplies: [UInt64: Result<(SMB2Header, Data), Error>] = [:]
+    /// MessageIds we've emitted and are still awaiting a FINAL reply for. This
+    /// (not a bare counter) is the source of truth for "is a reply expected":
+    /// it lets the reader (a) park only when genuinely idle and (b) ignore
+    /// unsolicited server messages (oplock/lease breaks, duplicates) instead of
+    /// mistaking them for a reply and parking with a real read still in flight.
+    private var awaiting: Set<UInt64> = []
+
+    /// At most one request may be sent "optimistically" when the credit balance
+    /// is empty and nothing is in flight to replenish it — mirrors the serial
+    /// path (which never blocks on credits) without letting a herd of waiters
+    /// all over-subscribe at once. Cleared when a real grant arrives.
+    private var optimisticInFlight = false
+
+    // Wire-emission mutex: makes "assign messageId → build → sign → encrypt →
+    // send" atomic and in messageId order, without holding across the reply.
+    private var wireBusy = false
+    private var wireWaiters: [CheckedContinuation<Void, Never>] = []
+
+    // Weighted async credit gate. Waiters are woken on every grant and
+    // re-check; those still short re-suspend (correct for mixed charges).
+    private var creditWaiters: [CheckedContinuation<Void, Never>] = []
+
+    // Reader parks here when nothing is outstanding, to avoid tripping the
+    // transport's idle receive timeout. Unparked when a request is emitted.
+    private var readerParkCont: CheckedContinuation<Void, Never>?
+
     // ── Signing ────────────────────────────────────────────────────────
     // After a successful SESSION_SETUP the session base key is run
     // through the SP800-108 KDF (for SMB 3.x) to derive a signing key.
@@ -223,17 +296,34 @@ public actor SMBSession {
         storedCredentials = credentials
         storedSharePath   = sharePath
 
+        // Start from clean state in case this session object is being reused:
+        // stop any prior reader, wipe pipeline state, and zero the SMB2 counters
+        // so NEGOTIATE goes out with MessageId 0 and a fresh credit balance.
+        stopReader()
+        resetPipelineState()
+        messageId        = 0
+        creditsAvailable = 0
+        sessionId        = 0
+        treeId           = 0
+
         try await transport.connect()
         try await negotiate()
         try await authenticate(credentials)
         try await treeConnect(sharePath)
         startKeepalive()
+        // Handshake done and preauth frozen — safe to enable pipelining now.
+        startReader()
     }
 
     /// Tear everything down gracefully: stop keepalive → TREE_DISCONNECT → LOGOFF → TCP close.
     public func disconnect() async {
         stopKeepalive()
 
+        // Send the graceful TREE_DISCONNECT/LOGOFF FIRST, while the reader is
+        // still running — they go through whichever path is active (pipelined
+        // if the reader is up). Doing this before stopping the reader avoids
+        // two concurrent `transport.receive()` calls (reader + serial logoff)
+        // stealing each other's bytes.
         if treeId != 0 {
             _ = try? await sendRequest(
                 command: SMB2Command.treeDisconnect,
@@ -248,6 +338,14 @@ public actor SMBSession {
             )
             sessionId = 0
         }
+
+        // Now stop the reader and fail anything still pending before closing,
+        // then wipe pipeline state so a later connectShare on this session is
+        // clean (also clears any stuck wire mutex).
+        stopReader()
+        failPipeline(SMBError.connectionLost)
+        resetPipelineState()
+
         signingKey = nil
         encryptionKey = Data()
         decryptionKey = Data()
@@ -269,6 +367,13 @@ public actor SMBSession {
         // Tear down without waiting for graceful logoff — the connection
         // is already dead if we're reconnecting.
         stopKeepalive()
+        // Stop the reader and fail every in-flight/waiting pipelined request,
+        // then wipe all pipeline state so the fresh session starts clean. This
+        // is the coordination the handoff flagged as missing between reconnect()
+        // and the in-flight machinery.
+        stopReader()
+        failPipeline(SMBError.connectionLost)
+        resetPipelineState()
         signingKey = nil
         encryptionKey = Data()
         decryptionKey = Data()
@@ -285,6 +390,7 @@ public actor SMBSession {
             try await authenticate(creds)
             try await treeConnect(share)
             startKeepalive()
+            startReader()
             return true
         } catch {
             return false
@@ -346,6 +452,18 @@ public actor SMBSession {
             securityMode:    parsed.securityMode,
             chosenCipher:    parsed.chosenCipher
         )
+
+        // Streaming throughput is bounded by how big a single SMB2 READ can be.
+        // If a server (or a fallback) leaves maxReadSize at the 64 KiB floor,
+        // every read pays a full round-trip for very little data and playback
+        // stutters — so surface the negotiated size for diagnosis. [SwiftSMB]
+        #if DEBUG
+        let dialectHex = String(parsed.dialectRevision, radix: 16)
+        print("[SwiftSMB] negotiated dialect=0x\(dialectHex) " +
+              "maxReadSize=\(parsed.maxReadSize) " +
+              "maxWriteSize=\(parsed.maxWriteSize) " +
+              "maxTransactSize=\(parsed.maxTransactSize)")
+        #endif
     }
 
     /// Run the two-round NTLMv2 SESSION_SETUP handshake.
@@ -718,12 +836,41 @@ public actor SMBSession {
 
     // MARK: - Request core
 
+    /// True when the pipelined path should handle a request: pipelining is
+    /// enabled, the background reader is up, we're past the handshake, and the
+    /// pipeline hasn't died. The handshake (preauthActive) and teardown always
+    /// fall back to the serial path.
+    private var pipeliningActive: Bool {
+        // Deliberately does NOT read `maxInFlightRequests` (which can be mutated
+        // at runtime) — `readerRunning` already implies the reader was started
+        // with pipelining enabled, so this can't flip to serial mid-session.
+        pipeliningEnabled && readerRunning && !preauthActive && pipelineDead == nil
+    }
+
     /// Send one SMB2 request and return the parsed header plus the raw body.
     ///
-    /// The `payloadSize` parameter is used to compute the correct
-    /// `CreditCharge` for large operations (READ, WRITE, QUERY_DIRECTORY).
-    /// Pass 0 for small commands (NEGOTIATE, SESSION_SETUP, CLOSE, etc.).
+    /// Dispatches to the pipelined engine when it's active (many requests in
+    /// flight) or the original serial round-trip otherwise (handshake, and the
+    /// `maxInFlightRequests == 1` fallback).
+    ///
+    /// `payloadSize` sizes the `CreditCharge` for large ops (READ, WRITE,
+    /// QUERY_DIRECTORY). Pass 0 for small commands.
     public func sendRequest(
+        command: UInt16,
+        body: Data,
+        payloadSize: Int = 0
+    ) async throws -> (SMB2Header, Data) {
+        if pipeliningActive {
+            let charge = Self.creditCharge(forPayloadLength: payloadSize)
+            try await creditAcquire(charge)
+            return try await sendPipelined(command: command, body: body, charge: charge)
+        }
+        return try await sendRequestSerial(command: command, body: body, payloadSize: payloadSize)
+    }
+
+    /// The original single-in-flight round-trip. Kept verbatim: it is the
+    /// handshake path (preauth ordering) and the serial fallback.
+    private func sendRequestSerial(
         command: UInt16,
         body: Data,
         payloadSize: Int = 0
@@ -878,6 +1025,377 @@ public actor SMBSession {
         let respBody = response.subdata(in: response.startIndex + smb2HeaderSize ..< response.endIndex)
         return (respHeader, respBody)
     }
+
+    // MARK: - Pipelined request engine
+
+    /// True when pipelining is currently handling requests. Read by the client
+    /// layer to decide whether to fan out parallel reads/writes.
+    public var isPipelining: Bool { pipeliningActive }
+
+    /// Read/write fan-out width (never < 1). Snapshot taken at connect.
+    public func readWriteConcurrency() -> Int { max(1, activeConcurrency) }
+
+    /// Per-request credit ask: keep the balance healthy enough to sustain many
+    /// in-flight requests, bounded so we never request an absurd amount.
+    private static func pipelinedCreditRequest(_ charge: UInt16) -> UInt16 {
+        UInt16(min(512, max(64, Int(charge) * 8)))
+    }
+
+    // ── Credit gate ─────────────────────────────────────────────────────
+
+    /// Reserve exactly `charge` credits, suspending until the balance covers
+    /// it. Used by small control ops whose charge is tiny (always affordable
+    /// once the session is up); large reads/writes use `reserveCredits`.
+    func creditAcquire(_ charge: UInt16) async throws {
+        let need = max(1, charge)
+        while true {
+            if let f = pipelineDead { throw f }
+            if creditsAvailable >= need {
+                creditsAvailable &-= need
+                return
+            }
+            // Balance can't cover this. If nothing is outstanding to replenish
+            // it, send optimistically (like the serial path, which never blocks
+            // on credits) — the request itself elicits a fresh grant. Only one
+            // waiter may do this at a time, to avoid a herd over-subscribing.
+            if awaiting.isEmpty && !optimisticInFlight {
+                optimisticInFlight = true
+                // Spend whatever partial balance we have (keeps accounting sane);
+                // callers pre-size large transfers via `reserveCredits`, so this
+                // path effectively only ever fires for charge-1 control ops.
+                creditsAvailable &-= min(need, creditsAvailable)
+                return
+            }
+            await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in
+                creditWaiters.append(c)
+            }
+        }
+    }
+
+    /// Reserve up to `desired` credits, returning how many were actually taken
+    /// (always ≥ 1). Suspends only while the balance is completely empty — so a
+    /// read/write shrinks to what's affordable instead of dead-locking on a
+    /// stingy server (mirrors the serial path's `affordablePayloadLength`).
+    public func reserveCredits(upTo desired: UInt16) async throws -> UInt16 {
+        let want = max(1, desired)
+        while true {
+            if let f = pipelineDead { throw f }
+            if creditsAvailable >= 1 {
+                let take = min(want, creditsAvailable)
+                creditsAvailable &-= take
+                return take
+            }
+            // Empty balance. If nothing is in flight to replenish it, take a
+            // single credit optimistically so the read/write can go out and
+            // elicit a grant (mirrors the serial path). One waiter at a time.
+            if awaiting.isEmpty && !optimisticInFlight {
+                optimisticInFlight = true
+                return 1
+            }
+            await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in
+                creditWaiters.append(c)
+            }
+        }
+    }
+
+    /// Hand back credits reserved but not spent (e.g. a read shrank below its
+    /// reservation). Does not represent a server grant.
+    public func releaseCredits(_ n: UInt16) {
+        guard n > 0 else { return }
+        creditsAvailable &+= n
+        wakeCreditWaiters()
+    }
+
+    /// Apply a server credit grant from a response and wake waiters. A real
+    /// grant clears the optimism gate so normal crediting resumes.
+    private func creditGrant(_ granted: UInt16) {
+        creditsAvailable &+= granted
+        optimisticInFlight = false
+        wakeCreditWaiters()
+    }
+
+    /// Wake every credit waiter; each re-checks and re-suspends if still short.
+    /// (Wake-all is required because waiters have different charges — a strict
+    /// FIFO could park a small waiter behind a large one that can't yet run.)
+    private func wakeCreditWaiters() {
+        guard !creditWaiters.isEmpty else { return }
+        let waiters = creditWaiters
+        creditWaiters.removeAll()
+        for c in waiters { c.resume() }
+    }
+
+    // ── Wire-emission mutex ─────────────────────────────────────────────
+
+    private func wireAcquire() async {
+        if !wireBusy { wireBusy = true; return }
+        await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in
+            wireWaiters.append(c)
+        }
+    }
+    private func wireRelease() {
+        if wireWaiters.isEmpty { wireBusy = false }
+        else { wireWaiters.removeFirst().resume() }
+    }
+
+    // ── Send + await reply ──────────────────────────────────────────────
+
+    /// Emit a request whose `charge` credits were ALREADY reserved (via
+    /// `creditAcquire`/`reserveCredits`) and suspend until its reply arrives.
+    /// The single background reader resumes us by MessageId.
+    public func sendPipelined(
+        command: UInt16,
+        body: Data,
+        charge: UInt16
+    ) async throws -> (SMB2Header, Data) {
+        if let f = pipelineDead { throw f }
+        let mid: UInt64
+        do {
+            mid = try await emitOnWire(command: command, body: body, charge: charge)
+        } catch {
+            failPipeline(error)
+            throw error
+        }
+        return try await withCheckedThrowingContinuation {
+            (cont: CheckedContinuation<(SMB2Header, Data), Error>) in
+            // The reader can run between our send and here; check both the
+            // failure flag and the early-reply stash before parking.
+            if let f = pipelineDead {
+                cont.resume(throwing: f)
+            } else if let early = earlyReplies.removeValue(forKey: mid) {
+                cont.resume(with: verifyCommand(early, expected: command))
+            } else {
+                pending[mid] = Pending(command: command, continuation: cont)
+            }
+        }
+    }
+
+    /// Assign a MessageId, build/sign/encrypt the packet, and put it on the
+    /// wire — all under the wire mutex so packets leave in MessageId order.
+    private func emitOnWire(command: UInt16, body: Data, charge: UInt16) async throws -> UInt64 {
+        await wireAcquire()
+        defer { wireRelease() }
+        if let f = pipelineDead { throw f }
+
+        let mid = messageId
+        messageId &+= UInt64(charge)
+
+        let header = SMB2HeaderBuilder.build(
+            command:       command,
+            creditCharge:  charge,
+            creditRequest: Self.pipelinedCreditRequest(charge),
+            messageId:     mid,
+            sessionId:     sessionId,
+            treeId:        treeId
+        )
+        var packet = Data()
+        packet.append(header)
+        packet.append(body)
+
+        if let key = signingKey {
+            Self.setSignedFlag(&packet)
+            let sig = computeSignature(packet: packet, key: key)
+            packet.replaceSubrange(48..<64, with: sig.prefix(16))
+        }
+
+        // No preauth-hash update here — pipelining is only active after the
+        // handshake has frozen the preauth hash.
+
+        let wireOut: Data
+        if encryptionEnabled && !encryptionKey.isEmpty {
+            wireOut = try SMB2TransformBuilder.buildGCM(
+                plaintext:     packet,
+                encryptionKey: encryptionKey,
+                sessionId:     sessionId
+            )
+        } else {
+            wireOut = packet
+        }
+
+        try await transport.send(wireOut)
+        awaiting.insert(mid)
+        unparkReader()
+        return mid
+    }
+
+    /// Enforce that a reply's command matches the request it's delivered to.
+    private func verifyCommand(
+        _ result: Result<(SMB2Header, Data), Error>,
+        expected: UInt16
+    ) -> Result<(SMB2Header, Data), Error> {
+        if case .success(let (h, _)) = result, h.command != expected {
+            return .failure(SMBError.unexpectedCommand(expected: expected, got: h.command))
+        }
+        return result
+    }
+
+    // ── Background reader ───────────────────────────────────────────────
+
+    /// Start the single reader task (no-op unless pipelining is enabled).
+    /// Snapshots `maxInFlightRequests` so runtime mutation can't destabilize a
+    /// live session.
+    public func startReader() {
+        guard maxInFlightRequests > 1, readerTask == nil else { return }
+        pipelineDead = nil
+        pipeliningEnabled = true
+        activeConcurrency = maxInFlightRequests
+        readerRunning = true
+        readerTask = Task { [weak self] in
+            await self?.readerLoop()
+        }
+    }
+
+    /// Stop the reader task. Does not by itself fail in-flight requests —
+    /// callers pair it with `failPipeline` when tearing the session down.
+    public func stopReader() {
+        readerRunning = false
+        pipeliningEnabled = false
+        let t = readerTask
+        readerTask = nil
+        unparkReader()
+        t?.cancel()
+    }
+
+    private func parkReader() async {
+        await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in
+            readerParkCont = c
+        }
+    }
+    private func unparkReader() {
+        if let c = readerParkCont { readerParkCont = nil; c.resume() }
+    }
+
+    private func readerLoop() async {
+        while readerRunning {
+            // Nothing outstanding → park rather than block on receive() and trip
+            // its idle timeout. Unparked by the next emitOnWire.
+            if awaiting.isEmpty {
+                await parkReader()
+                continue
+            }
+            let raw: Data
+            do {
+                raw = try await transport.receive()
+            } catch {
+                failPipeline(error)
+                return
+            }
+            route(raw)
+        }
+    }
+
+    /// Decrypt, verify, credit, and dispatch a single received message.
+    private func route(_ raw: Data) {
+        var data = raw
+
+        if SMB2TransformParser.isTransformPacket(data) {
+            guard !decryptionKey.isEmpty else {
+                failPipeline(SMBError.signatureVerificationFailed); return
+            }
+            do {
+                let parsed = try SMB2TransformParser.parse(data)
+                data = try SMB2TransformParser.decryptGCM(parsed, decryptionKey: decryptionKey)
+            } catch { failPipeline(error); return }
+        }
+
+        guard data.count >= smb2HeaderSize else {
+            failPipeline(SMBError.truncatedPacket); return
+        }
+        let header: SMB2Header
+        do { header = try SMB2Header.parse(data) } catch { failPipeline(error); return }
+        let mid = header.messageId
+
+        // Interim async STATUS_PENDING is NOT the final reply — absorb any
+        // credit grant it carries and keep the request awaiting.
+        if header.status == NTStatus.pending && (header.flags & SMB2Flags.asyncCommand) != 0 {
+            creditGrant(header.creditGranted)
+            return
+        }
+
+        // Only messages we actually sent count as replies. Anything else — an
+        // unsolicited oplock/lease break (MessageId 0xFFFF…FFFF), a duplicate,
+        // or a stray — is absorbed for its credit grant and otherwise ignored,
+        // so it can never decrement `awaiting` or park the reader while a real
+        // reply is still in flight. (We don't ACK oplock breaks; the previous
+        // serial code didn't handle them either.)
+        guard awaiting.contains(mid) else {
+            creditGrant(header.creditGranted)
+            return
+        }
+
+        // Verify signature (mirrors the serial path).
+        if signingKey != nil && (header.flags & SMB2Flags.signed) != 0 {
+            var mutable = data
+            mutable.replaceSubrange(48..<64, with: Data(count: 16))
+            let expected = computeSignature(packet: mutable, key: signingKey!)
+            if expected.prefix(16) != header.signature {
+                creditGrant(header.creditGranted)
+                awaiting.remove(mid)
+                deliver(mid, .failure(SMBError.signatureVerificationFailed))
+                return
+            }
+        }
+
+        creditGrant(header.creditGranted)
+        awaiting.remove(mid)
+        let body = data.subdata(in: data.startIndex + smb2HeaderSize ..< data.endIndex)
+        deliver(mid, .success((header, body)))
+    }
+
+    private func deliver(_ mid: UInt64, _ result: Result<(SMB2Header, Data), Error>) {
+        if let entry = pending.removeValue(forKey: mid) {
+            entry.continuation.resume(with: verifyCommand(result, expected: entry.command))
+        } else {
+            // Reply for an awaited request landed before the sender registered
+            // its continuation — stash it; `sendPipelined` claims it on wake.
+            earlyReplies[mid] = result
+        }
+    }
+
+    /// Fatal pipeline error: fail every in-flight and waiting request, stop the
+    /// reader, and put the session into a state where further pipelined sends
+    /// throw until `reconnect()` resets it.
+    private func failPipeline(_ error: Error) {
+        if pipelineDead == nil { pipelineDead = error }
+        readerRunning = false
+        let inflight = pending
+        pending.removeAll()
+        for (_, e) in inflight { e.continuation.resume(throwing: error) }
+        earlyReplies.removeAll()
+        awaiting.removeAll()
+        optimisticInFlight = false
+        // Credit waiters re-check, see pipelineDead, and throw. (Waiters in the
+        // wire mutex unwind naturally as the current holder releases and its
+        // emitOnWire sees pipelineDead.)
+        wakeCreditWaiters()
+        unparkReader()
+    }
+
+    /// Clear all pipeline state for a fresh connection (used by reconnect and
+    /// before/after connect so a reused session starts clean).
+    private func resetPipelineState() {
+        pipelineDead = nil
+        pending.removeAll()
+        earlyReplies.removeAll()
+        awaiting.removeAll()
+        optimisticInFlight = false
+        creditWaiters.removeAll()
+        readerParkCont = nil
+        wireBusy = false
+        wireWaiters.removeAll()
+    }
+
+    #if DEBUG
+    // ── Test hooks (DEBUG only) ─────────────────────────────────────────
+    // Let unit tests drive the credit gate without a live server. The gate
+    // touches no transport state, so it can be exercised on an unconnected
+    // session.
+    func _testApplyGrant(_ n: UInt16) { creditGrant(n) }
+    var _testCreditsAvailable: UInt16 { creditsAvailable }
+    func _testSetCredits(_ n: UInt16) { creditsAvailable = n }
+    /// Simulate an in-flight request so the credit gate blocks (rather than
+    /// taking the optimistic no-outstanding escape) when the balance is short.
+    func _testMarkAwaiting(_ mid: UInt64) { awaiting.insert(mid) }
+    #endif
 
     // MARK: - Signing helpers
 
