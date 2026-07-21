@@ -145,4 +145,41 @@ final class SMBSessionPipelineTests: XCTestCase {
         let left = await s._testCreditsAvailable
         XCTAssertEqual(left, 0, "all \(n) waiters drained the pool exactly")
     }
+
+    // MARK: - Opt-in pipelining (default must be serial)
+
+    func testPipeliningIsSerialByDefault() async {
+        let s = SMBSession(host: "127.0.0.1", port: 1)
+        let n = await s.maxInFlightRequests
+        XCTAssertEqual(n, 1, "pipelining must be OPT-IN: default is serial (1)")
+    }
+
+    func testInitParamOptsIn() async {
+        let s = SMBSession(host: "127.0.0.1", port: 1, maxInFlightRequests: 8)
+        let n = await s.maxInFlightRequests
+        XCTAssertEqual(n, 8)
+    }
+
+    func testInitParamClampsToAtLeastOne() async {
+        let s = SMBSession(host: "127.0.0.1", port: 1, maxInFlightRequests: 0)
+        let n = await s.maxInFlightRequests
+        XCTAssertEqual(n, 1, "must clamp to >= 1")
+    }
+
+    func testSetterChangesAndClamps() async {
+        let s = SMBSession(host: "127.0.0.1", port: 1)
+        await s.setMaxInFlightRequests(6)
+        var n = await s.maxInFlightRequests
+        XCTAssertEqual(n, 6)
+        await s.setMaxInFlightRequests(-3)
+        n = await s.maxInFlightRequests
+        XCTAssertEqual(n, 1, "must clamp to >= 1")
+    }
+
+    func testClientForwardsOptIn() async {
+        // SMBClient wraps a session; the client-level knob must propagate.
+        let c = SMBClient(host: "127.0.0.1", port: 1, maxInFlightRequests: 4)
+        await c.setMaxInFlightRequests(3)   // must not trap / must forward
+        _ = c
+    }
 }
