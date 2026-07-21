@@ -207,7 +207,16 @@ public actor SMBClient {
     ) async throws -> Data {
         guard !range.isEmpty else { return Data() }
         let normalized = Self.normalize(path)
-        let chunkSize = await chunkReadSize()
+
+        // Same windowed engine as streaming: parallel reads (in order) when
+        // pipelining is on, single-in-flight otherwise. Routing big reads
+        // through `windowedRead`/`reserveCredits` (rather than the plain gate)
+        // also keeps large charges off the optimistic credit path.
+        let pipelining = await session.isPipelining
+        let width = pipelining ? await session.readWriteConcurrency() : 1
+        let chunk = pipelining
+            ? min(Int(await chunkReadSize()), 1 << 20)
+            : Int(await chunkReadSize())
 
         return try await withFileHandle(
             path: normalized,
@@ -215,37 +224,13 @@ public actor SMBClient {
         ) { fileId in
             var collected = Data()
             collected.reserveCapacity(Int(range.upperBound - range.lowerBound))
-
-            var offset = range.lowerBound
-            while offset < range.upperBound {
-                let remaining = range.upperBound - offset
-                // Cap to credit-affordable size so we never exceed our balance.
-                let desired   = min(UInt64(chunkSize), remaining)
-                let affordable = await self.session.affordablePayloadLength(desired: Int(desired))
-                let thisLen   = min(desired, UInt64(affordable))
-
-                let body = SMB2ReadRequest.build(
-                    fileId: fileId,
-                    offset: offset,
-                    length: UInt32(thisLen)
-                )
-                let (header, respBody) = try await self.session.sendRequest(
-                    command: SMB2Command.read,
-                    body: body,
-                    payloadSize: Int(thisLen)
-                )
-
-                if header.status == NTStatus.endOfFile { break }
-                guard header.isSuccess else {
-                    throw Self.mapNTStatus(header.status, path: normalized)
-                }
-
-                let parsed = try SMB2ReadResponse.parse(respBody)
-                if parsed.data.isEmpty { break }
-                collected.append(parsed.data)
-                offset += UInt64(parsed.data.count)
+            try await self.windowedRead(
+                fileId: fileId, path: normalized, range: range,
+                chunk: chunk, width: width
+            ) { slice in
+                collected.append(slice)
+                return true
             }
-
             return collected
         }
     }
@@ -272,30 +257,12 @@ public actor SMBClient {
                 createOptions: SMB2CreateOptions.nonDirectoryFile
             )
         ) { fileId in
-            var cursor = offset
-            var remaining = data
-            while !remaining.isEmpty {
-                let affordable = await self.session.affordablePayloadLength(desired: Int(chunkSize))
-                let thisLen = min(remaining.count, affordable)
-                let slice = remaining.prefix(thisLen)
-
-                let body = SMB2WriteRequest.build(
-                    fileId: fileId,
-                    offset: cursor,
-                    data: Data(slice)
-                )
-                let (header, respBody) = try await self.session.sendRequest(
-                    command: SMB2Command.write,
-                    body: body,
-                    payloadSize: thisLen
-                )
-                guard header.isSuccess else {
-                    throw Self.mapNTStatus(header.status, path: normalized)
-                }
-                let parsed = try SMB2WriteResponse.parse(respBody)
-                cursor += UInt64(parsed.count)
-                remaining = Data(remaining.dropFirst(Int(parsed.count)))
-            }
+            let width = await self.session.isPipelining
+                ? await self.session.readWriteConcurrency() : 1
+            try await self.windowedWrite(
+                fileId: fileId, path: normalized, baseOffset: offset,
+                data: data, chunk: Int(chunkSize), width: width
+            )
         }
     }
 
@@ -317,31 +284,116 @@ public actor SMBClient {
             )
         ) { fileId in
             let chunkSize = await self.chunkWriteSize()
-            var cursor: UInt64 = 0
-            var offset = data.startIndex
+            let width = await self.session.isPipelining
+                ? await self.session.readWriteConcurrency() : 1
+            try await self.windowedWrite(
+                fileId: fileId, path: normalized, baseOffset: 0,
+                data: data, chunk: Int(chunkSize), width: width
+            )
+        }
+    }
 
-            while offset < data.endIndex {
-                let affordable = await self.session.affordablePayloadLength(desired: Int(chunkSize))
-                let end = min(offset + affordable, data.endIndex)
-                let slice = data[offset..<end]
+    /// Write `data` to an open handle starting at `baseOffset`. With pipelining
+    /// on, up to `width` SMB2 WRITEs run concurrently (writes to distinct
+    /// offsets are independent, so order doesn't matter); otherwise it's the
+    /// original single-in-flight loop.
+    private func windowedWrite(
+        fileId: SMB2FileId,
+        path: String,
+        baseOffset: UInt64,
+        data: Data,
+        chunk: Int,
+        width: Int
+    ) async throws {
+        let total = data.count
+        guard total > 0 else { return }
+        let step = max(1, chunk)
+        let pipelining = await session.isPipelining
 
-                let body = SMB2WriteRequest.build(
-                    fileId: fileId,
-                    offset: cursor,
-                    data: Data(slice)
+        // ── Serial path ─────────────────────────────────────────────────
+        if !pipelining || width <= 1 {
+            var pos = 0
+            while pos < total {
+                let affordable = await session.affordablePayloadLength(desired: step)
+                let end = min(pos + max(1, affordable), total)
+                let slice = data.subdata(in: data.startIndex + pos ..< data.startIndex + end)
+                let body = SMB2WriteRequest.build(fileId: fileId, offset: baseOffset + UInt64(pos), data: slice)
+                let (header, respBody) = try await session.sendRequest(
+                    command: SMB2Command.write, body: body, payloadSize: slice.count
                 )
-                let (header, respBody) = try await self.session.sendRequest(
-                    command: SMB2Command.write,
-                    body: body,
-                    payloadSize: slice.count
-                )
-                guard header.isSuccess else {
-                    throw Self.mapNTStatus(header.status, path: normalized)
-                }
+                guard header.isSuccess else { throw Self.mapNTStatus(header.status, path: path) }
                 let parsed = try SMB2WriteResponse.parse(respBody)
-                cursor += UInt64(parsed.count)
-                offset += Int(parsed.count)
+                guard parsed.count > 0 else { throw Self.mapNTStatus(header.status, path: path) }
+                pos += Int(parsed.count)
             }
+            return
+        }
+
+        // ── Pipelined path: up to `width` concurrent write slices ────────
+        var starts: [Int] = []
+        var s = 0
+        while s < total { starts.append(s); s += step }
+        var idx = 0
+        var inflight: [Task<Void, Error>] = []
+        inflight.reserveCapacity(width)
+
+        func spawn() {
+            guard idx < starts.count else { return }
+            let start = starts[idx]; idx += 1
+            let end = min(start + step, total)
+            let slice = data.subdata(in: data.startIndex + start ..< data.startIndex + end)
+            let fileOffset = baseOffset + UInt64(start)
+            inflight.append(Task { [weak self] in
+                guard let self = self else { return }
+                try await self.pipelinedWriteSlice(fileId: fileId, offset: fileOffset, slice: slice, path: path)
+            })
+        }
+
+        func drain() async {
+            for t in inflight { t.cancel() }
+            for t in inflight { _ = try? await t.value }
+            inflight.removeAll()
+        }
+
+        for _ in 0..<max(1, width) { spawn() }
+        while !inflight.isEmpty {
+            do {
+                try await inflight.removeFirst().value
+            } catch {
+                await drain()
+                throw error
+            }
+            spawn()
+        }
+    }
+
+    /// Write an entire slice at `offset`, issuing pipelined SMB2 WRITEs sized to
+    /// affordable credits and looping over any partial writes.
+    private func pipelinedWriteSlice(
+        fileId: SMB2FileId,
+        offset: UInt64,
+        slice: Data,
+        path: String
+    ) async throws {
+        let n = slice.count
+        var pos = 0
+        while pos < n {
+            let remaining = n - pos
+            let desiredCharge = SMBSession.creditCharge(forPayloadLength: remaining)
+            let take = try await session.reserveCredits(upTo: desiredCharge)
+            let len = min(remaining, Int(take) * 65536)
+            let actualCharge = SMBSession.creditCharge(forPayloadLength: len)
+            if take > actualCharge { await session.releaseCredits(take - actualCharge) }
+
+            let chunkData = slice.subdata(in: slice.startIndex + pos ..< slice.startIndex + pos + len)
+            let body = SMB2WriteRequest.build(fileId: fileId, offset: offset + UInt64(pos), data: chunkData)
+            let (header, respBody) = try await session.sendPipelined(
+                command: SMB2Command.write, body: body, charge: actualCharge
+            )
+            guard header.isSuccess else { throw Self.mapNTStatus(header.status, path: path) }
+            let parsed = try SMB2WriteResponse.parse(respBody)
+            guard parsed.count > 0 else { throw Self.mapNTStatus(header.status, path: path) }
+            pos += Int(parsed.count)
         }
     }
 
@@ -581,14 +633,198 @@ public actor SMBClient {
         try await contents(atPath: path, range: range)
     }
 
+    /// Preferred SMB2 READ size (bytes) for bulk streaming. Uses the full
+    /// server-negotiated `maxReadSize` so a latency-bound link isn't throttled
+    /// by tiny reads — the dominant throughput limiter when streaming video to
+    /// AVPlayer. Clamped to `[512 KiB, 8 MiB]`: never smaller than the old
+    /// 512 KiB behavior, never so large that one failed read wastes much
+    /// bandwidth or that its credit charge (`ceil(size / 64 KiB)`) is
+    /// unaffordable on a fresh session.
+    func streamingReadSize() async -> Int {
+        let negotiated = await session.negotiated
+        let serverMax  = negotiated?.maxReadSize ?? (64 * 1024)
+        let floor:   UInt32 = 512 * 1024
+        let ceiling: UInt32 = 8 << 20
+        return Int(min(max(serverMax, floor), ceiling))
+    }
+
+    /// Stream a byte range from a file, delivering it in order to `onSlice`.
+    ///
+    /// Unlike `contents(atPath:range:)` — which the proxy used to call once per
+    /// chunk, paying a full CREATE + READ + CLOSE round-trip *per chunk* — this
+    /// opens the SMB2 file handle **once** for the whole range, issues
+    /// back-to-back READs against it, then closes. On a latency-bound path that
+    /// removes ~2 of every ~3 round-trips (the per-chunk open/close), which is
+    /// the single biggest lever for streaming throughput.
+    ///
+    /// Each READ is sized to ``streamingReadSize()`` (bigger reads → fewer
+    /// round-trips) and capped to the credit-affordable length so we never
+    /// exceed our SMB2 credit balance.
+    ///
+    /// `onSlice` receives each slice, in order, as it arrives; return `false`
+    /// to stop early (e.g. the HTTP client hung up). The whole
+    /// open→reads→close sequence holds the client's file-op lock, preserving
+    /// the "one open handle per session at a time" invariant that some strict
+    /// NAS servers enforce.
+    func streamRange(
+        atPath path: String,
+        range: Range<UInt64>,
+        onSlice: @Sendable (Data) async -> Bool
+    ) async throws {
+        guard !range.isEmpty else { return }
+        let normalized = Self.normalize(path)
+
+        // When pipelining is on we favour MANY 1 MiB reads in flight over a few
+        // huge ones: 1 MiB costs 16 credits (comfortably affordable), and the
+        // window width (not the read size) provides the throughput. When it's
+        // off we fall back to the biggest single read the server allows.
+        let pipelining = await session.isPipelining
+        let width = pipelining ? await session.readWriteConcurrency() : 1
+        let chunk = pipelining
+            ? min(await streamingReadSize(), 1 << 20)
+            : await streamingReadSize()
+
+        try await withFileHandle(
+            path: normalized,
+            body: SMB2CreateRequest.openFile(path: normalized)
+        ) { fileId in
+            try await self.windowedRead(
+                fileId: fileId, path: normalized, range: range,
+                chunk: chunk, width: width, onSlice: onSlice
+            )
+        }
+    }
+
+    /// Read `range` from an already-open handle and deliver each slice IN ORDER
+    /// to `onSlice`. With pipelining on, up to `width` SMB2 READs are in flight
+    /// at once (delivered in offset order via a sliding window); otherwise it's
+    /// a single-in-flight loop identical to the serial behavior.
+    private func windowedRead(
+        fileId: SMB2FileId,
+        path: String,
+        range: Range<UInt64>,
+        chunk: Int,
+        width: Int,
+        onSlice: (Data) async -> Bool
+    ) async throws {
+        let pipelining = await session.isPipelining
+
+        // ── Serial path (pipelining off) ────────────────────────────────
+        if !pipelining || width <= 1 {
+            var offset = range.lowerBound
+            while offset < range.upperBound {
+                let remaining = range.upperBound - offset
+                let desired   = min(UInt64(chunk), remaining)
+                let affordable = await session.affordablePayloadLength(desired: Int(desired))
+                let thisLen   = max(1, min(desired, UInt64(affordable)))
+                let body = SMB2ReadRequest.build(fileId: fileId, offset: offset, length: UInt32(thisLen))
+                let (header, respBody) = try await session.sendRequest(
+                    command: SMB2Command.read, body: body, payloadSize: Int(thisLen)
+                )
+                if header.status == NTStatus.endOfFile { break }
+                guard header.isSuccess else { throw Self.mapNTStatus(header.status, path: path) }
+                let parsed = try SMB2ReadResponse.parse(respBody)
+                if parsed.data.isEmpty { break }
+                let keepGoing = await onSlice(parsed.data)
+                offset += UInt64(parsed.data.count)
+                if !keepGoing { break }
+            }
+            return
+        }
+
+        // ── Pipelined path: sliding window of concurrent reads ───────────
+        // Offsets are pre-assigned assuming each window slot returns its FULL
+        // `chunk` bytes. That holds because `pipelinedReadChunk` reads exactly
+        // `want` bytes (looping internally when a single READ is credit-limited)
+        // and only returns short at EOF — which can only be the final slot, so
+        // no gaps appear between slots. SMB2 servers only short-read at EOF.
+        var nextOffset = range.lowerBound
+        var inflight: [Task<Data, Error>] = []
+        inflight.reserveCapacity(width)
+
+        func spawn() {
+            guard nextOffset < range.upperBound else { return }
+            let start = nextOffset
+            let want  = min(UInt64(chunk), range.upperBound - start)
+            nextOffset = start + want
+            inflight.append(Task { [weak self] in
+                guard let self = self else { return Data() }
+                return try await self.pipelinedReadChunk(fileId: fileId, offset: start, want: want, path: path)
+            })
+        }
+
+        func drain() async {
+            for t in inflight { t.cancel() }
+            for t in inflight { _ = try? await t.value }
+            inflight.removeAll()
+        }
+
+        for _ in 0..<max(1, width) { spawn() }
+
+        while !inflight.isEmpty {
+            let data: Data
+            do {
+                data = try await inflight.removeFirst().value   // strictly in order
+            } catch {
+                await drain()
+                throw error
+            }
+            if data.isEmpty { await drain(); break }             // EOF
+            let keepGoing = await onSlice(data)
+            if !keepGoing { await drain(); break }
+            spawn()
+        }
+    }
+
+    /// Read exactly `want` bytes (or fewer only at EOF) starting at `offset`
+    /// from an open handle, issuing pipelined SMB2 READs sized to the credits
+    /// currently affordable. Loops when a single read is credit-limited so the
+    /// caller's window offsets stay aligned.
+    private func pipelinedReadChunk(
+        fileId: SMB2FileId,
+        offset: UInt64,
+        want: UInt64,
+        path: String
+    ) async throws -> Data {
+        var collected = Data()
+        collected.reserveCapacity(Int(want))
+        var pos = offset
+        let end = offset + want
+
+        while pos < end {
+            if Task.isCancelled { break }   // aborted window slot — stop pulling bytes
+            let remaining = end - pos
+            let desiredCharge = SMBSession.creditCharge(forPayloadLength: Int(remaining))
+            let take = try await session.reserveCredits(upTo: desiredCharge)
+            let len = min(remaining, UInt64(take) * 65536)
+            let actualCharge = SMBSession.creditCharge(forPayloadLength: Int(len))
+            if take > actualCharge { await session.releaseCredits(take - actualCharge) }
+
+            let body = SMB2ReadRequest.build(fileId: fileId, offset: pos, length: UInt32(len))
+            let (header, respBody) = try await session.sendPipelined(
+                command: SMB2Command.read, body: body, charge: actualCharge
+            )
+            if header.status == NTStatus.endOfFile { break }
+            guard header.isSuccess else { throw Self.mapNTStatus(header.status, path: path) }
+            let parsed = try SMB2ReadResponse.parse(respBody)
+            if parsed.data.isEmpty { break }
+            collected.append(parsed.data)
+            pos += UInt64(parsed.data.count)
+        }
+        return collected
+    }
+
     // MARK: - Private helpers
 
     private func chunkReadSize() async -> UInt32 {
         let negotiated = await session.negotiated
         let serverMax  = negotiated?.maxReadSize ?? (64 * 1024)
-        // Cap at 1 MiB — large enough to be efficient, small enough that
-        // any single failed read doesn't waste much bandwidth.
-        return min(serverMax, 1 << 20)
+        // Cap at 2 MiB — large enough to keep round-trips low on a
+        // latency-bound link (this also feeds the MKV/transmux and
+        // sample-buffer tiers via contents(range:)), small enough that any
+        // single failed read doesn't waste much bandwidth. Never exceeds the
+        // server-advertised maxReadSize.
+        return min(serverMax, 2 << 20)
     }
 
     private func chunkWriteSize() async -> UInt32 {

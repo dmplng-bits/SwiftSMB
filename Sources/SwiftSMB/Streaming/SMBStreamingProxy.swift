@@ -257,41 +257,73 @@ public actor SMBStreamingProxy {
         connection.cancel()
     }
 
-    /// Pull data from the SMB client in reasonable chunks and push it
-    /// down the HTTP connection.
+    /// Pump the requested byte range from SMB to the HTTP connection using a
+    /// read-ahead **producer → consumer** pipeline.
+    ///
+    /// The old implementation read a 512 KiB chunk, then sent it, then read the
+    /// next — strictly serial, so while a chunk was being pushed to AVPlayer
+    /// nothing was being read from SMB and vice-versa. Half the wall-clock was
+    /// wasted, and 512 KiB chunks doubled the SMB round-trip count vs the
+    /// server's `maxReadSize`.
+    ///
+    /// Now:
+    ///   * a **producer** task calls `client.streamRange`, which opens the SMB2
+    ///     handle ONCE and reads `streamingReadSize()`-sized chunks back-to-back
+    ///     (removes the per-chunk CREATE/CLOSE round-trips, and reads at the
+    ///     negotiated max size — Lever 1);
+    ///   * each chunk is handed to a bounded queue that applies back-pressure
+    ///     (so we never buffer the whole file);
+    ///   * a **consumer** — this function's own loop — drains the queue to the
+    ///     socket. The next SMB read overlaps the current socket send (Lever 2).
+    ///
+    /// On any socket send failure we cancel the producer and finish the queue so
+    /// a producer parked on back-pressure wakes and unwinds (closing the SMB
+    /// handle). We then await the producer so no SMB read is left in flight when
+    /// the caller cancels the connection.
     private func streamBody(
         _ connection: NWConnection,
         smbPath: String,
         range: Range<UInt64>
     ) async {
-        // 512 KiB is a good balance between latency (AVPlayer likes prompt
-        // first bytes) and throughput.
-        let chunkSize: UInt64 = 512 * 1024
-        var cursor = range.lowerBound
+        guard let client = client else { return }
 
-        while cursor < range.upperBound {
-            guard let client = client else { return }
-            let thisEnd = min(cursor + chunkSize, range.upperBound)
-            let slice: Data
+        // Chunk = negotiated maxReadSize (Lever 1). Keep a few chunks in flight
+        // so a read always overlaps a send (Lever 2). Reads are serialized by
+        // SMBSession's io-mutex, so a small depth already keeps the consumer
+        // fed; cap the in-flight bytes (~8 MiB) to bound memory on tvOS.
+        let chunkSize = await client.streamingReadSize()
+        let targetInFlight = 8 * 1024 * 1024
+        let prefetch = max(2, min(4, targetInFlight / max(chunkSize, 1)))
+        let queue = BoundedDataQueue(capacity: prefetch)
+
+        // Producer: open once, read ahead into the bounded queue. `enqueue`
+        // returns false once the consumer has finished the queue (client gone),
+        // which stops `streamRange` early.
+        let producer = Task {
             do {
-                slice = try await client.internalContents(
-                    atPath: smbPath,
-                    range: cursor..<thisEnd
-                )
+                try await client.streamRange(atPath: smbPath, range: range) { slice in
+                    await queue.enqueue(slice)
+                }
             } catch {
-                // Nothing we can do at this point — the headers are already
-                // on the wire, so we just drop the connection.
-                return
+                // Headers are already on the wire; nothing to do but stop.
             }
-            if slice.isEmpty { return }
+            await queue.finish()
+        }
+
+        // Consumer: drain to the socket. A send failure means AVPlayer hung up.
+        while let slice = await queue.dequeue() {
             do {
                 try await Self.rawSend(connection, data: slice)
             } catch {
-                return
+                break
             }
-            cursor += UInt64(slice.count)
-            if slice.count == 0 { return }
         }
+
+        // Unwind the producer: cancel it, then finish the queue so a producer
+        // parked on a full queue wakes, sees the queue is closed, and returns.
+        producer.cancel()
+        await queue.finish()
+        _ = await producer.value
     }
 
     // MARK: - Request parsing helpers
@@ -494,5 +526,81 @@ extension SMBStreamingProxy {
 
             return ParsedRequest(method: method, path: path, version: version, headers: headers)
         }
+    }
+}
+
+// MARK: - Bounded async queue (producer/consumer back-pressure)
+
+/// A bounded FIFO of `Data` buffers connecting exactly one producer to one
+/// consumer, with async back-pressure in both directions:
+///   * `enqueue` suspends while the queue is full (so the producer can't read
+///     the whole file into memory — it stalls until the consumer drains);
+///   * `dequeue` suspends while the queue is empty (so the consumer waits for
+///     the next chunk instead of spinning);
+///   * `finish` marks end-of-stream and wakes every waiter, so neither side can
+///     deadlock once the other stops.
+///
+/// Sized for the single-producer/single-consumer streaming path — it does not
+/// try to be a general multi-writer queue.
+actor BoundedDataQueue {
+    private let capacity: Int
+    private var buffer: [Data] = []
+    private var finished = false
+    private var spaceWaiters: [CheckedContinuation<Void, Never>] = []
+    private var itemWaiters:  [CheckedContinuation<Data?, Never>] = []
+
+    init(capacity: Int) {
+        self.capacity = max(1, capacity)
+    }
+
+    /// Append `data`, suspending while the queue is full. Returns `false` if the
+    /// queue was finished (consumer gone) — the caller should stop producing.
+    @discardableResult
+    func enqueue(_ data: Data) async -> Bool {
+        // Wait for space. Re-check after each wake: another actor hop may have
+        // refilled the buffer or finished the stream.
+        while buffer.count >= capacity && !finished {
+            await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in
+                spaceWaiters.append(c)
+            }
+        }
+        if finished { return false }
+
+        // Hand off directly to a parked consumer if one is waiting; otherwise
+        // buffer it. (A consumer only parks when the buffer is empty, so a
+        // direct hand-off never violates the capacity bound.)
+        if !itemWaiters.isEmpty {
+            itemWaiters.removeFirst().resume(returning: data)
+        } else {
+            buffer.append(data)
+        }
+        return true
+    }
+
+    /// Remove and return the oldest buffered chunk, suspending while empty.
+    /// Returns `nil` once the queue is finished AND drained.
+    func dequeue() async -> Data? {
+        if !buffer.isEmpty {
+            let next = buffer.removeFirst()
+            // Wake one producer waiting for space.
+            if !spaceWaiters.isEmpty {
+                spaceWaiters.removeFirst().resume()
+            }
+            return next
+        }
+        if finished { return nil }
+        return await withCheckedContinuation { (c: CheckedContinuation<Data?, Never>) in
+            itemWaiters.append(c)
+        }
+    }
+
+    /// Signal end-of-stream and wake all waiters. Idempotent.
+    func finish() {
+        guard !finished else { return }
+        finished = true
+        for c in itemWaiters { c.resume(returning: nil) }
+        itemWaiters.removeAll()
+        for c in spaceWaiters { c.resume() }
+        spaceWaiters.removeAll()
     }
 }
