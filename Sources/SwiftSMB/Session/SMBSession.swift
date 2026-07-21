@@ -146,18 +146,31 @@ public actor SMBSession {
     //
     // Pipelining is only active AFTER the handshake (the handshake needs
     // strict request/response ordering for the preauth-integrity hash and
-    // runs on the serial path with the reader stopped). Setting
-    // `maxInFlightRequests` to 1 disables pipelining entirely — the session
-    // then behaves exactly like the original serial implementation, which
-    // is the safe fallback if the pipeline ever misbehaves against a server.
+    // runs on the serial path with the reader stopped).
+    //
+    // Pipelining is STRICTLY OPT-IN: `maxInFlightRequests` defaults to 1, so an
+    // unconfigured session behaves exactly like the original serial
+    // implementation. Only bulk-throughput-bound workloads (e.g. the direct-play
+    // streaming proxy) should raise it. Latency/jitter-sensitive callers — the
+    // real-time transmux/sample-buffer path that reads via `contents(range:)` —
+    // must leave it at 1: the background reader, parallel reads, and credit
+    // bookkeeping otherwise compete with real-time decode and cause playback
+    // jitter (see the pipelining-opt-in handoff).
 
-    /// Maximum SMB2 requests allowed on the wire at once. 1 = serial (no
-    /// pipeline). Applied to reads/writes as the read/write concurrency.
-    /// Read ONCE, at connect, into `activeConcurrency`/`pipeliningEnabled` —
-    /// mutating it on a live session has no effect until the next connect, so
-    /// the pipeline can never flip to serial mid-session (which would put two
-    /// readers on the socket).
-    public var maxInFlightRequests: Int = 8
+    /// Maximum SMB2 requests allowed on the wire at once. **Defaults to 1
+    /// (serial); pipelining is opt-in.** Raise it only for bulk-transfer
+    /// sessions, via the `maxInFlightRequests:` initializer parameter or
+    /// ``setMaxInFlightRequests(_:)``.
+    ///
+    /// Snapshotted ONCE, at connect, into `activeConcurrency`/`pipeliningEnabled`
+    /// — so configure it BEFORE `connectShare`. Mutating it on a connected
+    /// session has no effect until the next connect, which also guarantees the
+    /// pipeline can never flip to serial mid-session (two readers on one socket).
+    ///
+    /// Externally read-only: set it through the initializer or
+    /// ``setMaxInFlightRequests(_:)`` (writing an actor's stored property from
+    /// outside the actor is not allowed).
+    public private(set) var maxInFlightRequests: Int = 1
 
     /// Snapshot of `maxInFlightRequests` taken when the reader started. Governs
     /// whether pipelining is active and the read/write fan-out width.
@@ -258,16 +271,35 @@ public actor SMBSession {
 
     // MARK: Init
 
-    public init(transport: SMBTransport) {
+    /// - Parameter maxInFlightRequests: request-pipelining width. Defaults to 1
+    ///   (serial). Raise it only for bulk-transfer sessions (see the property
+    ///   docs). Clamped to ≥ 1.
+    public init(transport: SMBTransport, maxInFlightRequests: Int = 1) {
         self.transport = transport
+        self.maxInFlightRequests = max(1, maxInFlightRequests)
     }
 
     // Note: in Swift 6 actor inits cannot be marked `convenience`, and
     // they also cannot delegate via `self.init(...)` (that pattern
     // implicitly requires `convenience`). So this secondary init
     // initialises the stored property directly instead.
-    public init(host: String, port: UInt16 = 445) {
+    /// - Parameter maxInFlightRequests: request-pipelining width. Defaults to 1
+    ///   (serial). Raise it only for bulk-transfer sessions. Clamped to ≥ 1.
+    public init(host: String, port: UInt16 = 445, maxInFlightRequests: Int = 1) {
         self.transport = SMBTransport(host: host, port: port)
+        self.maxInFlightRequests = max(1, maxInFlightRequests)
+    }
+
+    /// Opt this session into (or out of) request pipelining. `n` is the maximum
+    /// number of SMB2 requests allowed on the wire at once; 1 = serial (the
+    /// default). Clamped to ≥ 1.
+    ///
+    /// - Important: takes effect at the NEXT `connectShare`/`reconnect` — the
+    ///   value is snapshotted when the background reader starts. Call it BEFORE
+    ///   connecting; changing it on an already-connected session is a no-op
+    ///   until the next connect.
+    public func setMaxInFlightRequests(_ n: Int) {
+        maxInFlightRequests = max(1, n)
     }
 
     // MARK: - Accessors (for the Client layer)

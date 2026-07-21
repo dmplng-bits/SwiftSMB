@@ -54,8 +54,20 @@ public actor SMBClient {
         self.session = session
     }
 
-    public init(host: String, port: UInt16 = 445) {
-        self.session = SMBSession(host: host, port: port)
+    /// - Parameter maxInFlightRequests: request-pipelining width for the
+    ///   underlying session. Defaults to 1 (serial). Raise it only for a client
+    ///   dedicated to bulk transfer (e.g. the direct-play streaming path);
+    ///   leave it at 1 for latency-sensitive `contents(range:)` readers.
+    public init(host: String, port: UInt16 = 445, maxInFlightRequests: Int = 1) {
+        self.session = SMBSession(host: host, port: port, maxInFlightRequests: maxInFlightRequests)
+    }
+
+    /// Opt this client's session into (or out of) request pipelining.
+    /// See ``SMBSession/setMaxInFlightRequests(_:)``. `n` = max SMB2 requests in
+    /// flight at once; 1 = serial (default). Call BEFORE `connectShare` — it's
+    /// snapshotted at connect time.
+    public func setMaxInFlightRequests(_ n: Int) async {
+        await session.setMaxInFlightRequests(n)
     }
 
     // MARK: - Connection lifecycle
